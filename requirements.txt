@@ -1,0 +1,19 @@
+# PyTNC Pro v0.1.0-beta Dependencies
+
+# GUI
+PyQt6>=6.4.0
+PyQt6-WebEngine>=6.4.0
+
+# Audio Processing
+numpy>=1.21.0
+scipy>=1.7.0
+sounddevice>=0.4.4
+
+# Image Processing
+Pillow>=9.0.0
+
+# Serial Communication
+pyserial>=3.5
+
+# Optional: For building executables
+# pyinstaller>=5.0.0

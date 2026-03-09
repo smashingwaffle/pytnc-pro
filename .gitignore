@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime/Cache
+tile_cache/
+aprs_icon_cache/
+pytnc_cache/
+*.log
+
+# Generated files
+aprs_map.html
+
+# User data (don't commit personal settings)
+pytnc_settings.json
+pytnc_conversations.json
+pytnc_links.json
+imported_data/
+
+# OS files
+.DS_Store
+Thumbs.db
