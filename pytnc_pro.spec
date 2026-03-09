@@ -47,6 +47,10 @@ datas = [
     # Python modules
     ('pytnc_config.py', '.'),
     ('aprs_parser.py', '.'),
+    ('ax25_parser.py', '.'),
+    ('pytnc_modem.py', '.'),
+    ('true_direwolf_demod.py', '.'),
+    ('hdlc_bitbybit.py', '.'),
     
     # TNC module
     ('tnc', 'tnc'),
@@ -78,8 +82,17 @@ hiddenimports = [
     'serial.tools.list_ports',
     'scipy',
     'scipy.signal',
+    'scipy.signal.windows',
+    'scipy.fft',
+    'scipy.special',
+    'scipy.special._cdflib',
+    'scipy.ndimage',
     'pytnc_config',
     'aprs_parser',
+    'ax25_parser',
+    'pytnc_modem',
+    'true_direwolf_demod',
+    'hdlc_bitbybit',
 ]
 
 # Collect sounddevice - it's a single module, not a package, so collect manually
@@ -134,12 +147,60 @@ else:
     print("[SPEC] WARNING: Could not find site-packages with sounddevice!")
     binaries = []
 
-# Collect scipy data
+# Collect scipy - ALL of it (data, binaries, submodules)
+# First, ensure we're using the venv's scipy
+if site_packages:
+    sys.path.insert(0, site_packages)
+    print(f"[SPEC] Added to sys.path: {site_packages}")
+
+scipy_collected = False
 try:
-    from PyInstaller.utils.hooks import collect_data_files
-    datas += collect_data_files('scipy')
-except Exception:
-    pass
+    from PyInstaller.utils.hooks import collect_all
+    scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all('scipy')
+    if scipy_datas or scipy_binaries or scipy_hiddenimports:
+        datas += scipy_datas
+        binaries += scipy_binaries
+        hiddenimports += scipy_hiddenimports
+        scipy_collected = True
+        print(f"[SPEC] Collected scipy: {len(scipy_datas)} datas, {len(scipy_binaries)} binaries, {len(scipy_hiddenimports)} imports")
+    else:
+        print(f"[SPEC] Warning: collect_all('scipy') returned empty")
+except Exception as e:
+    print(f"[SPEC] Warning: Could not collect scipy via hooks: {e}")
+
+# Manual fallback - copy scipy folder directly if collect_all failed
+if not scipy_collected and site_packages:
+    scipy_path = os.path.join(site_packages, 'scipy')
+    if os.path.exists(scipy_path):
+        datas += [(scipy_path, 'scipy')]
+        print(f"[SPEC] Manual scipy collection: {scipy_path}")
+    else:
+        print(f"[SPEC] ERROR: scipy not found at {scipy_path}")
+
+# Also collect numpy
+numpy_collected = False
+try:
+    from PyInstaller.utils.hooks import collect_all
+    numpy_datas, numpy_binaries, numpy_hiddenimports = collect_all('numpy')
+    if numpy_datas or numpy_binaries or numpy_hiddenimports:
+        datas += numpy_datas
+        binaries += numpy_binaries
+        hiddenimports += numpy_hiddenimports
+        numpy_collected = True
+        print(f"[SPEC] Collected numpy: {len(numpy_datas)} datas, {len(numpy_binaries)} binaries, {len(numpy_hiddenimports)} imports")
+    else:
+        print(f"[SPEC] Warning: collect_all('numpy') returned empty")
+except Exception as e:
+    print(f"[SPEC] Warning: Could not collect numpy via hooks: {e}")
+
+# Manual fallback
+if not numpy_collected and site_packages:
+    numpy_path = os.path.join(site_packages, 'numpy')
+    if os.path.exists(numpy_path):
+        datas += [(numpy_path, 'numpy')]
+        print(f"[SPEC] Manual numpy collection: {numpy_path}")
+    else:
+        print(f"[SPEC] ERROR: numpy not found at {numpy_path}")
 
 a = Analysis(
     ['main.py'],
