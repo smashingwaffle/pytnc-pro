@@ -249,7 +249,7 @@ TOCALL_DEVICES = {
     "APWL2K": "Winlink 2000",
     
     # === PyTNC Pro (official TOCALL: APPR0? registered to KO6IKR) ===
-    "APPR01": "PyTNC Pro v0.1.0-beta",
+    "APPR01": "PyTNC Pro v0.1.1-beta",
     "APPR0": "PyTNC Pro",
     "APZ": "Experimental Software",
     

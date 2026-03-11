@@ -12,7 +12,7 @@ Features:
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.0-beta"
+__version__ = "0.1.1-beta"
 VERSION = __version__
 
 import sys
@@ -823,6 +823,7 @@ class MainWindow(QMainWindow):
         self.aprs_is_socket = None
         self.aprs_is_thread = None
         self.aprs_is_running = False
+        self.aprs_is_connected = False  # Connection status flag for UI
         
         # VARA FM connection
         self.vara_connected = False
@@ -853,6 +854,9 @@ class MainWindow(QMainWindow):
         self._log(f"HTTP server: http://127.0.0.1:{http_port}/")
         self._log(f"User data: {USER_DATA_DIR}")
         self._log("=" * 50)
+        
+        # Initialize connection status display
+        QTimer.singleShot(100, self._sync_beacon_connection_status)
 
     def _init(self):
         global HESSU_SYMBOLS_DIR
@@ -1066,7 +1070,7 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self.aprs_is_info_label)
         
         # APRS-IS Connect button
-        self.aprs_is_connect_btn = QPushButton("🌐 APRS-IS")
+        self.aprs_is_connect_btn = QPushButton("🌐 START IS")
         self.aprs_is_connect_btn.setFixedHeight(22)
         self.aprs_is_connect_btn.clicked.connect(self.toggle_aprs_is)
         self.aprs_is_connect_btn.setStyleSheet("""
@@ -1090,7 +1094,7 @@ class MainWindow(QMainWindow):
         ctrl_layout.addSpacing(10)
         
         # Start/Stop buttons (compact)
-        self.start_btn = QPushButton("▶ START")
+        self.start_btn = QPushButton("▶ START RF")
         self.start_btn.setFixedHeight(22)
         self.start_btn.clicked.connect(self.start)
         self.start_btn.setStyleSheet("""
@@ -1108,7 +1112,7 @@ class MainWindow(QMainWindow):
         """)
         ctrl_layout.addWidget(self.start_btn)
         
-        self.stop_btn = QPushButton("■ STOP")
+        self.stop_btn = QPushButton("■ STOP RF")
         self.stop_btn.setFixedHeight(22)
         self.stop_btn.clicked.connect(self.stop)
         self.stop_btn.setEnabled(False)
@@ -1455,6 +1459,10 @@ class MainWindow(QMainWindow):
         self.tx_vara_status = QLabel("⚫ VARA: Not connected")
         self.tx_vara_status.setStyleSheet("color: #607d8b;")
         status_layout.addWidget(self.tx_vara_status, 1, 1)
+        
+        self.tx_rf_status = QLabel("⚫ RF: Not connected")
+        self.tx_rf_status.setStyleSheet("color: #607d8b;")
+        status_layout.addWidget(self.tx_rf_status, 2, 0)
         
         self.tx_aprs_is_status = QLabel("⚫ APRS-IS: Not connected")
         self.tx_aprs_is_status.setStyleSheet("color: #607d8b;")
@@ -2682,44 +2690,6 @@ class MainWindow(QMainWindow):
         
         right_col.addWidget(vara_grp)
         
-        # === FILE PATHS (compact) ===
-        paths_grp = QGroupBox("📁 File Paths")
-        paths_grp.setStyleSheet(self._group_style())
-        paths_layout = QGridLayout(paths_grp)
-        paths_layout.setSpacing(2)
-        
-        paths_layout.addWidget(QLabel("APRS:"), 0, 0)
-        self.aprs_preset_path = QLineEdit()
-        self.aprs_preset_path.setPlaceholderText("aprs.xml")
-        paths_layout.addWidget(self.aprs_preset_path, 0, 1)
-        aprs_browse = QPushButton("...")
-        aprs_browse.setFixedWidth(25)
-        aprs_browse.clicked.connect(lambda: self._browse_xml_file(self.aprs_preset_path))
-        paths_layout.addWidget(aprs_browse, 0, 2)
-        
-        paths_layout.addWidget(QLabel("Default:"), 1, 0)
-        self.default_preset_path = QLineEdit()
-        self.default_preset_path.setPlaceholderText("defaultv002.xml")
-        paths_layout.addWidget(self.default_preset_path, 1, 1)
-        default_browse = QPushButton("...")
-        default_browse.setFixedWidth(25)
-        default_browse.clicked.connect(lambda: self._browse_xml_file(self.default_preset_path))
-        paths_layout.addWidget(default_browse, 1, 2)
-        
-        paths_layout.addWidget(QLabel("LAX503:"), 2, 0)
-        self.lax503_preset_path = QLineEdit()
-        self.lax503_preset_path.setPlaceholderText("overrides_only.xml")
-        paths_layout.addWidget(self.lax503_preset_path, 2, 1)
-        lax503_browse = QPushButton("...")
-        lax503_browse.setFixedWidth(25)
-        lax503_browse.clicked.connect(lambda: self._browse_xml_file(self.lax503_preset_path))
-        paths_layout.addWidget(lax503_browse, 2, 2)
-        
-        # Hidden VARA preset path (removed from UI but kept for compatibility)
-        self.vara_preset_path = QLineEdit()
-        
-        right_col.addWidget(paths_grp)
-        
         # === STARTUP OPTIONS ===
         startup_grp = QGroupBox("🚀 Startup")
         startup_grp.setStyleSheet(self._group_style())
@@ -3132,16 +3102,6 @@ class MainWindow(QMainWindow):
                     combo.addItem(f"{i}: {dev['name']} [{api_short}] {sr}Hz {ch}ch", i)
         except Exception as e:
             combo.addItem(f"(error: {e})", -1)
-    
-    def _browse_xml_file(self, line_edit):
-        """Browse for XML preset file"""
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Select XML Preset File", 
-            str(BASE_DIR), 
-            "XML Files (*.xml);;All Files (*)"
-        )
-        if filename:
-            line_edit.setText(filename)
     
     def _on_path_changed(self, path_text):
         """Handle PATH combo change - informational only now"""
@@ -4415,6 +4375,15 @@ class MainWindow(QMainWindow):
             self.aprs_is_socket.send(packet.encode())
             self._log(f"✅ Beacon sent via APRS-IS!")
             
+            # Log to APRS tab TX Log (cyan color for APRS-IS)
+            self.preset_log.append(f"<br><span style='color:#00d4ff'>🌐 Transmitting APRS-IS beacon...</span>")
+            self.preset_log.append(f"   From: <span style='color:#ffd54f'>{full_call}</span>")
+            self.preset_log.append(f"   To: APPR01-0 via TCPIP*")
+            self.preset_log.append(f"   Position: <span style='color:#80deea'>{pos}</span>")
+            
+            # Log to APRS live feed (MAP tab)
+            self._log(f"🌐 TX Beacon: {full_call} via APRS-IS")
+            
             # Plot our own position on the map
             try:
                 ic, ov = icon_path(symbol_table, symbol_code)
@@ -5046,7 +5015,7 @@ class MainWindow(QMainWindow):
             if tx_device is not None and tx_name:
                 # Truncate long names
                 short_name = tx_name[:20] + "..." if len(tx_name) > 20 else tx_name
-                self.tx_audio_status.setText(f"🟢 TX: {short_name}")
+                self.tx_audio_status.setText(f"🟢 TX Audio: {short_name}")
                 self.tx_audio_status.setStyleSheet("color: #69f0ae;")
             else:
                 self.tx_audio_status.setText("⚫ TX Audio: Not set")
@@ -5067,6 +5036,21 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'settings_vara_status'):
                 self.settings_vara_status.setText("⚫")
                 self.settings_vara_status.setStyleSheet("color: #607d8b;")
+        
+        # RF RX Status (receiver running)
+        if hasattr(self, 'tx_rf_status'):
+            if hasattr(self, 'receiver') and self.receiver and self.receiver.isRunning():
+                # Get RX device from Settings tab
+                if hasattr(self, 'settings_rx_audio_combo'):
+                    rx_name = self.settings_rx_audio_combo.currentText()
+                    short_name = rx_name[:20] + "..." if len(rx_name) > 20 else rx_name
+                    self.tx_rf_status.setText(f"🟢 RF: {short_name}")
+                else:
+                    self.tx_rf_status.setText("🟢 RF: Connected")
+                self.tx_rf_status.setStyleSheet("color: #69f0ae;")
+            else:
+                self.tx_rf_status.setText("⚫ RF: Not connected")
+                self.tx_rf_status.setStyleSheet("color: #607d8b;")
         
         # APRS-IS Status
         if hasattr(self, 'aprs_is_connected') and self.aprs_is_connected:
@@ -6901,13 +6885,14 @@ class MainWindow(QMainWindow):
         if self.aprs_is_running:
             # Disconnect
             self.aprs_is_running = False
+            self.aprs_is_connected = False  # Clear connection flag
             if self.aprs_is_socket:
                 try:
                     self.aprs_is_socket.close()
                 except OSError:
                     pass  # Socket already closed
                 self.aprs_is_socket = None
-            self.aprs_is_connect_btn.setText("🌐 APRS-IS")
+            self.aprs_is_connect_btn.setText("🌐 START IS")
             self.aprs_is_status.setStyleSheet("color: #ff6b6b; font-size: 14px;")
             self.aprs_is_info_label.setText("")
             self._log("🌐 Disconnected from APRS-IS")
@@ -6916,6 +6901,8 @@ class MainWindow(QMainWindow):
                 self.settings_aprs_status.setText("⚫ Disconnected")
                 self.settings_aprs_status.setStyleSheet("color: #ef5350;")
                 self.settings_aprs_connect_btn.setText("Connect")
+            # Sync APRS tab connection status
+            self._sync_beacon_connection_status()
         else:
             # Sync from Settings tab if available
             if hasattr(self, 'settings_aprs_server'):
@@ -6949,7 +6936,7 @@ class MainWindow(QMainWindow):
             self.aprs_is_running = True
             self.aprs_is_thread.start()
             
-            self.aprs_is_connect_btn.setText("Disconnect")
+            self.aprs_is_connect_btn.setText("■ STOP IS")
             self.aprs_is_status.setStyleSheet("color: #ffb74d; font-size: 14px;")  # Yellow = connecting
     
     def _aprs_is_worker(self, server, port, callsign, filter_str):
@@ -6967,6 +6954,7 @@ class MainWindow(QMainWindow):
                 pc = self.settings_aprs_passcode.text().strip()
                 if pc:
                     passcode = pc
+            
             login = f"user {callsign} pass {passcode} vers PyTNC 019"
             if filter_str:
                 login += f" filter {filter_str}"
@@ -7025,8 +7013,9 @@ class MainWindow(QMainWindow):
     
     def _aprs_is_connected(self):
         """Called when APRS-IS connects successfully"""
+        self.aprs_is_connected = True  # Set connection flag for status panel
         self.aprs_is_status.setStyleSheet("color: #69f0ae; font-size: 14px;")  # Green
-        self.aprs_is_connect_btn.setText("Disconnect")
+        self.aprs_is_connect_btn.setText("■ STOP IS")
         self._log("✅ Connected to APRS-IS")
         # Sync settings tab status
         if hasattr(self, 'settings_aprs_status'):
@@ -7037,7 +7026,8 @@ class MainWindow(QMainWindow):
     
     def _aprs_is_disconnected(self):
         """Called when APRS-IS disconnects"""
-        self.aprs_is_connect_btn.setText("🌐 APRS-IS")
+        self.aprs_is_connected = False  # Clear connection flag
+        self.aprs_is_connect_btn.setText("🌐 START IS")
         self.aprs_is_status.setStyleSheet("color: #ff6b6b; font-size: 14px;")
         self.aprs_is_info_label.setText("")
         # Sync settings tab status
@@ -7045,6 +7035,7 @@ class MainWindow(QMainWindow):
             self.settings_aprs_status.setText("⚫ Disconnected")
             self.settings_aprs_status.setStyleSheet("color: #ef5350;")
             self.settings_aprs_connect_btn.setText("Connect")
+        # Sync APRS tab connection status
         self._sync_beacon_connection_status()
     
     def _handle_aprs_is_packet(self, line):
@@ -8115,12 +8106,6 @@ class MainWindow(QMainWindow):
             # Settings tab - Manual location
             "manual_location": self.manual_location.text() if hasattr(self, 'manual_location') else "",
             
-            # File paths
-            "aprs_preset_path": self.aprs_preset_path.text() if hasattr(self, 'aprs_preset_path') else "",
-            "default_preset_path": self.default_preset_path.text() if hasattr(self, 'default_preset_path') else "",
-            "lax503_preset_path": self.lax503_preset_path.text() if hasattr(self, 'lax503_preset_path') else "",
-            "vara_preset_path": self.vara_preset_path.text() if hasattr(self, 'vara_preset_path') else "",
-            
             # Winlink settings
             "wl_gateway": self.wl_gateway_edit.text() if hasattr(self, 'wl_gateway_edit') else "",
             
@@ -8453,16 +8438,6 @@ class MainWindow(QMainWindow):
             # Settings tab - Manual location
             if hasattr(self, 'manual_location') and "manual_location" in settings:
                 self.manual_location.setText(settings["manual_location"])
-            
-            # File paths
-            if hasattr(self, 'aprs_preset_path') and "aprs_preset_path" in settings:
-                self.aprs_preset_path.setText(settings["aprs_preset_path"])
-            if hasattr(self, 'default_preset_path') and "default_preset_path" in settings:
-                self.default_preset_path.setText(settings["default_preset_path"])
-            if hasattr(self, 'lax503_preset_path') and "lax503_preset_path" in settings:
-                self.lax503_preset_path.setText(settings["lax503_preset_path"])
-            if hasattr(self, 'vara_preset_path') and "vara_preset_path" in settings:
-                self.vara_preset_path.setText(settings["vara_preset_path"])
             
             # Winlink settings
             if hasattr(self, 'wl_gateway_edit') and "wl_gateway" in settings:
@@ -9247,6 +9222,10 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.status_lbl.setText("RECEIVING")
         self.dot.setStyleSheet("font-size:20px;color:#69f0ae")  # Bright green
+        
+        # Update APRS tab connection status (delayed to ensure thread starts)
+        if hasattr(self, '_sync_beacon_connection_status'):
+            QTimer.singleShot(100, self._sync_beacon_connection_status)
 
     def stop(self):
         if self.receiver:
@@ -9256,6 +9235,10 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.status_lbl.setText("STOPPED")
         self.dot.setStyleSheet("font-size:20px;color:#ff6b6b")  # Soft red
+        
+        # Update APRS tab connection status
+        if hasattr(self, '_sync_beacon_connection_status'):
+            self._sync_beacon_connection_status()
         self.meter.setValue(0)
 
     def on_packet(self, pkt, sl):
