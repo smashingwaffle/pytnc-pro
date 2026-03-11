@@ -36,7 +36,7 @@ A modern, feature-rich APRS transceiver for Windows with real-time mapping, emer
 - **GPS Support** - Serial GPS for automatic position updates
 - **Audio Device Selection** - Independent TX/RX audio routing
 
-### 💬 Messaging
+Future feature ::### 💬 Messaging
 - **APRS Messaging** - Send and receive APRS messages
 - **Message Acknowledgment** - Automatic retry with ACK/REJ
 - **Conversation History** - Persistent chat logs
