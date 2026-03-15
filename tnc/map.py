@@ -396,8 +396,15 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           renderer: L.canvas()
         });
         
-        // Create a canvas renderer for all circle markers
+        // Create a custom pane for trails (above tiles, below markers)
+        map.createPane('trailPane');
+        map.getPane('trailPane').style.zIndex = 450;  // Between tiles (200) and markers (600)
+        
+        // Create a canvas renderer for circle markers
         var canvasRenderer = L.canvas({ padding: 0.5 });
+        
+        // Create SVG renderer for trails (canvas doesn't render polylines well)
+        var svgRenderer = L.svg();
         
         // Track zoom state for conditional updates
         var zoomTimeout;
@@ -704,10 +711,13 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           });
         }
         
-        // Update station trail - only for mobile stations (SSID -9, -14, -15, etc.)
-        var ssid = call.split('-')[1] || '0';
-        var mobileSSIDs = ['9', '14', '15'];  // Car, truck, mobile
-        if (mobileSSIDs.includes(ssid)) {
+        // Update station trail - based on SPEED not SSID
+        // Extract speed from tooltip (e.g., "🚗 48 mph @ 180°" or "48 mph")
+        var speedMatch = tooltip ? tooltip.match(/(\d+(?:\.\d+)?)\s*mph/i) : null;
+        var speed = speedMatch ? parseFloat(speedMatch[1]) : 0;
+        
+        // Trail if moving > 1.5 mph
+        if (speed > 1.5) {
           updateTrail(call, lat, lon);
         }
         
@@ -747,7 +757,6 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         
         // Skip if teleport (> 5 km jump) - reset trail
         if (distKm > 5) {
-          console.log('Trail reset for ' + call + ': jumped ' + distKm.toFixed(1) + ' km');
           trailHistory[call] = [[lat, lon]];
           if (trails[call]) {
             map.removeLayer(trails[call]);
@@ -758,17 +767,6 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         
         // Skip if movement is too small (< 50 meters)
         if (distKm < 0.05) return;
-        
-        // Skip vertical/horizontal lines (GPS glitch pattern)
-        // Real driving has some angle to it
-        if (latDiff > 0.001 && lonDiff < 0.0001) {
-          console.log('Trail skip vertical for ' + call);
-          return;  // Pure north-south = suspicious
-        }
-        if (lonDiff > 0.001 && latDiff < 0.0001) {
-          console.log('Trail skip horizontal for ' + call);
-          return;  // Pure east-west = suspicious
-        }
         
         // Add position
         history.push([lat, lon]);
@@ -783,12 +781,14 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           if (trails[call]) {
             map.removeLayer(trails[call]);
           }
+          // Use SVG renderer (canvas renderer has issues with polylines)
           trails[call] = L.polyline(history, {
-            color: '#9c27b0',
-            weight: 2,
-            opacity: 0.7
+            color: '#ff00ff',       // Bright magenta for visibility
+            weight: 5,              // Thick line
+            opacity: 1.0,           // Full opacity
+            interactive: false,     // Don't interfere with clicks
+            renderer: svgRenderer   // Use shared SVG renderer
           }).addTo(map);
-          trails[call].bringToBack();
         }
       }
       

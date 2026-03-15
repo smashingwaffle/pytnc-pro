@@ -164,6 +164,7 @@ TOCALL_DEVICES = {
     "APOT": "Argent OpenTracker",
     "APOT2": "Argent OpenTracker2",
     "APOT3": "Argent OpenTracker3",
+    "APOTW": "Argent OpenTracker+Weather",
     "APDR": "APRSdroid",
     "APAND": "APRSdroid",
     "APRNOW": "APRSdroid (new)",

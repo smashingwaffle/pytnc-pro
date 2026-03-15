@@ -501,26 +501,34 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     if not text:
         return ""
     
+    # First, remove non-printable and non-ASCII characters (telemetry garbage)
+    text = ''.join(c for c in text if c.isprintable() and ord(c) < 128)
+    
     # Remove altitude data: /A=xxxxxx (exactly 6 digits per APRS spec, optional leading slash)
-    # Don't require word boundary - stations often omit space before comment
     text = re.sub(r'/?A=-?\d{6}', '', text)
     
     # Weather tokens pattern - matches individual weather data fields
-    # Note: ... (dots) means "no data" for that field
-    weather_tokens = r'(?:b[\d.]{5}|[Ll][\d.]{3}|#[\d.]{3,5}|c[\d.]{3}|s[\d.]{3}|g[\d.]{3}|t-?[\d.]{3}|r[\d.]{3}|p[\d.]{3}|P[\d.]{3}|h[\d.]{2})'
+    # Allow 1-6 digits to handle variations (g0, g005, b10156, etc.)
+    weather_tokens = r'(?:[cgstprPLl][\d.]{1,6}|h[\d.]{1,3}|b[\d.]{4,6}|#[\d.]{1,5})'
+    
+    # Remove OpenTracker version strings: V###OTW# (e.g., V118OTW1)
+    text = re.sub(r'V\d+OTW\d*', '', text)
     
     # Remove positionless weather format: _MMDDHHMM followed by weather data
-    # Example: _10090556c220s004g005t077r000p000P000h53b10090.DsVP
     text = re.sub(r'^_\d{8}' + weather_tokens + r'+\.?', '', text)
     
     # Remove .../SSS or DDD/SSS at start (wind direction/speed)
     text = re.sub(r'^\.{0,3}/[\d.]{3}', '', text)
     text = re.sub(r'^[\d.]{3}/[\d.]{3}', '', text)
     
-    # Remove concatenated weather tokens at start: c180s005g010t072h65b10234
+    # Remove concatenated weather tokens (anywhere in string)
+    # This catches: g0t055P000h48b10156
+    text = re.sub(weather_tokens + r'{2,}', '', text)
+    
+    # Remove individual weather tokens at start
     text = re.sub(r'^' + weather_tokens + r'+', '', text)
     
-    # Remove standalone weather tokens elsewhere (with word boundaries)
+    # Remove standalone weather tokens elsewhere
     text = re.sub(r'(?<!\w)' + weather_tokens + r'(?!\w)', '', text)
     
     # Remove Davis weather station suffix (.DsVP, .DsIP, etc.)
@@ -534,6 +542,10 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     
     # Remove potentially dangerous chars for HTML
     text = text.replace("'", "").replace('"', '').replace('<', '&lt;').replace('>', '&gt;')
+    
+    # If what remains is very short or just numbers/punctuation, discard it
+    if len(text) < 3 or not re.search(r'[a-zA-Z]{2}', text):
+        return ""
     
     # Truncate
     if len(text) > max_len:
