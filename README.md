@@ -240,4 +240,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**73 de PyTNC Pro Team** 📻
+73 de PyTNC Pro Team
+Stefaan Desmedt Los Angeles/Torhout Belgium
