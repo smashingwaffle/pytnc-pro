@@ -7,12 +7,12 @@ Features:
 - APRS-IS gateway integration
 - Beacon transmission with AFSK modulator
 - GPS support (NMEA via COM port)
-- PTT control (Serial RTS/DTR or VOX)
+- PTT control (Serial RTS/DTR)
 - VARA FM support
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.1-beta"
+__version__ = "0.1.2-beta"
 VERSION = __version__
 
 import sys
@@ -25,7 +25,6 @@ import threading
 import http.server
 import socket
 import socketserver
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
@@ -1006,6 +1005,14 @@ class MainWindow(QMainWindow):
         self.rx_callsign_check.stateChanged.connect(self._rx_toggle_callsigns)
         ctrl_layout.addWidget(self.rx_callsign_check)
         
+        # Station trails toggle
+        self.rx_trails_check = QCheckBox("〰️ Trails")
+        self.rx_trails_check.setToolTip("Show movement trails for mobile stations")
+        self.rx_trails_check.setStyleSheet("color: #ce93d8; font-size: 11px;")
+        self.rx_trails_check.setChecked(True)  # Default ON
+        self.rx_trails_check.stateChanged.connect(self._rx_toggle_trails)
+        ctrl_layout.addWidget(self.rx_trails_check)
+        
         # Hospital toggle on RX page
         self.rx_hospital_check = QCheckBox("🏥 Hospitals")
         self.rx_hospital_check.setToolTip("Show hospitals on map")
@@ -1715,6 +1722,52 @@ class MainWindow(QMainWindow):
         
         left_layout.addWidget(beacon_grp)
         
+        # Auto-Beacon Group
+        auto_beacon_grp = QGroupBox("⏱️ Auto-Beacon")
+        auto_beacon_grp.setStyleSheet(self._group_style())
+        auto_layout = QGridLayout(auto_beacon_grp)
+        auto_layout.setSpacing(6)
+        
+        # Enable checkbox
+        self.auto_beacon_enabled = QCheckBox("Enable auto-beacon")
+        self.auto_beacon_enabled.setToolTip("Automatically send beacon at regular intervals")
+        self.auto_beacon_enabled.stateChanged.connect(self._toggle_auto_beacon)
+        auto_layout.addWidget(self.auto_beacon_enabled, 0, 0, 1, 2)
+        
+        # Interval
+        auto_layout.addWidget(QLabel("Interval:"), 1, 0)
+        interval_layout = QHBoxLayout()
+        self.auto_beacon_interval = QSpinBox()
+        self.auto_beacon_interval.setRange(1, 60)
+        self.auto_beacon_interval.setValue(10)
+        self.auto_beacon_interval.setSuffix(" min")
+        self.auto_beacon_interval.setToolTip("Beacon interval in minutes")
+        self.auto_beacon_interval.valueChanged.connect(self._update_auto_beacon_interval)
+        interval_layout.addWidget(self.auto_beacon_interval)
+        interval_layout.addStretch()
+        auto_layout.addLayout(interval_layout, 1, 1)
+        
+        # Mode (RF, APRS-IS, or Both)
+        auto_layout.addWidget(QLabel("Mode:"), 2, 0)
+        self.auto_beacon_mode = QComboBox()
+        self.auto_beacon_mode.addItem("APRS-IS only", "is")
+        self.auto_beacon_mode.addItem("RF only", "rf")
+        self.auto_beacon_mode.addItem("Both RF + APRS-IS", "both")
+        self.auto_beacon_mode.setToolTip("How to send auto-beacons")
+        auto_layout.addWidget(self.auto_beacon_mode, 2, 1)
+        
+        # Status/countdown label
+        self.auto_beacon_status = QLabel("Auto-beacon: Off")
+        self.auto_beacon_status.setStyleSheet("color: #607d8b;")
+        auto_layout.addWidget(self.auto_beacon_status, 3, 0, 1, 2)
+        
+        left_layout.addWidget(auto_beacon_grp)
+        
+        # Initialize auto-beacon timer
+        self.auto_beacon_timer = QTimer()
+        self.auto_beacon_timer.timeout.connect(self._auto_beacon_tick)
+        self.auto_beacon_countdown = 0
+        
         left_layout.addStretch()
         
         settings_layout.addWidget(left_panel, 1)
@@ -2142,19 +2195,11 @@ class MainWindow(QMainWindow):
         ptt_layout = QGridLayout(ptt_grp)
         ptt_layout.setSpacing(4)
         
-        # Row 0: PTT Mode selector
-        ptt_layout.addWidget(QLabel("Mode:"), 0, 0)
-        self.ptt_mode_combo = QComboBox()
-        self.ptt_mode_combo.addItem("Serial RTS/DTR", "serial")
-        self.ptt_mode_combo.addItem("VOX (Audio-triggered)", "vox")
-        self.ptt_mode_combo.addItem("None (radio VOX)", "none")
-        self.ptt_mode_combo.currentIndexChanged.connect(self._ptt_mode_changed)
-        ptt_layout.addWidget(self.ptt_mode_combo, 0, 1, 1, 3)
-        
-        # Row 1: Serial port settings (for serial mode)
+        # Row 0: Serial port settings
         self.ptt_serial_widget = QWidget()
         ptt_serial_layout = QHBoxLayout(self.ptt_serial_widget)
         ptt_serial_layout.setContentsMargins(0, 0, 0, 0)
+        ptt_serial_layout.addWidget(QLabel("Port:"))
         self.settings_ptt_combo = QComboBox()
         self._populate_serial_combo(self.settings_ptt_combo)
         ptt_serial_layout.addWidget(self.settings_ptt_combo)
@@ -2164,9 +2209,9 @@ class MainWindow(QMainWindow):
         ptt_serial_layout.addWidget(self.settings_ptt_btn)
         self.settings_ptt_status = QLabel("⚫")
         ptt_serial_layout.addWidget(self.settings_ptt_status)
-        ptt_layout.addWidget(self.ptt_serial_widget, 1, 0, 1, 4)
+        ptt_layout.addWidget(self.ptt_serial_widget, 0, 0, 1, 4)
         
-        # Row 2: PTT Line settings - separate RTS and DTR (for serial mode)
+        # Row 1: PTT Line settings - separate RTS and DTR
         self.ptt_lines_widget = QWidget()
         ptt_lines_layout = QHBoxLayout(self.ptt_lines_widget)
         ptt_lines_layout.setContentsMargins(0, 0, 0, 0)
@@ -2179,36 +2224,9 @@ class MainWindow(QMainWindow):
         self.ptt_dtr_combo.addItems(["Off", "High=TX", "Low=TX"])
         self.ptt_dtr_combo.setCurrentIndex(1)  # Default DTR High=TX
         ptt_lines_layout.addWidget(self.ptt_dtr_combo)
-        ptt_layout.addWidget(self.ptt_lines_widget, 2, 0, 1, 4)
+        ptt_layout.addWidget(self.ptt_lines_widget, 1, 0, 1, 4)
         
-        # Row 3: VOX settings (for VOX mode)
-        self.ptt_vox_widget = QWidget()
-        ptt_vox_layout = QHBoxLayout(self.ptt_vox_widget)
-        ptt_vox_layout.setContentsMargins(0, 0, 0, 0)
-        ptt_vox_layout.addWidget(QLabel("Threshold:"))
-        self.vox_threshold = QSlider(Qt.Orientation.Horizontal)
-        self.vox_threshold.setRange(1, 100)
-        self.vox_threshold.setValue(10)
-        self.vox_threshold.setFixedWidth(80)
-        self.vox_threshold.setToolTip("Audio level to trigger PTT (1-100%)")
-        ptt_vox_layout.addWidget(self.vox_threshold)
-        self.vox_threshold_label = QLabel("10%")
-        self.vox_threshold_label.setFixedWidth(35)
-        self.vox_threshold.valueChanged.connect(lambda v: self.vox_threshold_label.setText(f"{v}%"))
-        ptt_vox_layout.addWidget(self.vox_threshold_label)
-        ptt_vox_layout.addWidget(QLabel("Hang:"))
-        self.vox_hang_time = QSpinBox()
-        self.vox_hang_time.setRange(100, 2000)
-        self.vox_hang_time.setValue(500)
-        self.vox_hang_time.setSuffix(" ms")
-        self.vox_hang_time.setToolTip("Time to hold PTT after audio stops")
-        self.vox_hang_time.setFixedWidth(80)
-        ptt_vox_layout.addWidget(self.vox_hang_time)
-        ptt_vox_layout.addStretch()
-        ptt_layout.addWidget(self.ptt_vox_widget, 3, 0, 1, 4)
-        self.ptt_vox_widget.hide()  # Hidden by default (serial mode)
-        
-        # Row 4: Test PTT button
+        # Row 2: Test PTT button
         self.ptt_test_btn = QPushButton("🔴 Test PTT")
         self.ptt_test_btn.setStyleSheet("""
             QPushButton { background: #c62828; color: white; font-weight: bold; border-radius: 4px; padding: 4px; }
@@ -2321,6 +2339,33 @@ class MainWindow(QMainWindow):
         mid_col = QVBoxLayout()
         mid_col.setSpacing(6)
         
+        # === APRS RANGE (prominent) ===
+        range_grp = QGroupBox("📡 APRS Range")
+        range_grp.setStyleSheet(self._group_style())
+        range_layout = QHBoxLayout(range_grp)
+        range_layout.setSpacing(8)
+        
+        range_layout.addWidget(QLabel("Show stations within:"))
+        self.settings_aprs_radius = QSpinBox()
+        self.settings_aprs_radius.setRange(10, 500)
+        self.settings_aprs_radius.setValue(100)
+        self.settings_aprs_radius.setSuffix(" km")
+        self.settings_aprs_radius.setToolTip("APRS-IS filter radius from your location")
+        self.settings_aprs_radius.setFixedWidth(90)
+        range_layout.addWidget(self.settings_aprs_radius)
+        
+        self.aprs_range_label = QLabel("(200 km diameter)")
+        self.aprs_range_label.setStyleSheet("color: #888; font-size: 11px;")
+        range_layout.addWidget(self.aprs_range_label)
+        
+        # Update diameter label when radius changes
+        self.settings_aprs_radius.valueChanged.connect(
+            lambda v: self.aprs_range_label.setText(f"({v*2} km diameter)")
+        )
+        
+        range_layout.addStretch()
+        mid_col.addWidget(range_grp)
+        
         # === APRS-IS (compact) ===
         aprs_grp = QGroupBox("🌐 APRS-IS")
         aprs_grp.setStyleSheet(self._group_style())
@@ -2337,26 +2382,21 @@ class MainWindow(QMainWindow):
         self.settings_aprs_port.setFixedWidth(65)
         aprs_layout.addWidget(self.settings_aprs_port, 0, 2)
         
-        aprs_layout.addWidget(QLabel("Filter:"), 1, 0)
-        self.settings_aprs_filter = QLineEdit("r/34.05/-118.25/100")
-        self.settings_aprs_filter.setFixedWidth(160)
-        aprs_layout.addWidget(self.settings_aprs_filter, 1, 1, 1, 2)
-        
-        aprs_layout.addWidget(QLabel("Pass:"), 2, 0)
+        aprs_layout.addWidget(QLabel("Pass:"), 1, 0)
         self.settings_aprs_passcode = QLineEdit()
         self.settings_aprs_passcode.setPlaceholderText("-1")
         self.settings_aprs_passcode.setEchoMode(QLineEdit.EchoMode.Password)
         self.settings_aprs_passcode.setFixedWidth(60)
-        aprs_layout.addWidget(self.settings_aprs_passcode, 2, 1)
+        aprs_layout.addWidget(self.settings_aprs_passcode, 1, 1)
         
         self.settings_aprs_connect_btn = QPushButton("Connect")
         self.settings_aprs_connect_btn.setFixedWidth(65)
         self.settings_aprs_connect_btn.clicked.connect(self._toggle_aprs_is_from_settings)
-        aprs_layout.addWidget(self.settings_aprs_connect_btn, 2, 2)
+        aprs_layout.addWidget(self.settings_aprs_connect_btn, 1, 2)
         
         self.settings_aprs_status = QLabel("⚫ Disconnected")
         self.settings_aprs_status.setStyleSheet("color: #ef5350; font-size: 10px;")
-        aprs_layout.addWidget(self.settings_aprs_status, 3, 0, 1, 3)
+        aprs_layout.addWidget(self.settings_aprs_status, 2, 0, 1, 3)
         mid_col.addWidget(aprs_grp)
         
         # === EARTHQUAKE MONITOR (compact) ===
@@ -3162,30 +3202,8 @@ class MainWindow(QMainWindow):
                     self.settings_ptt_status.setStyleSheet("color: #ef5350;")
                     self._log(f"❌ PTT error: {e}")
     
-    def _ptt_mode_changed(self, index):
-        """Handle PTT mode change"""
-        mode = self.ptt_mode_combo.currentData()
-        
-        if mode == "serial":
-            self.ptt_serial_widget.show()
-            self.ptt_lines_widget.show()
-            self.ptt_vox_widget.hide()
-            self._log("🎙️ PTT Mode: Serial RTS/DTR")
-        elif mode == "vox":
-            self.ptt_serial_widget.hide()
-            self.ptt_lines_widget.hide()
-            self.ptt_vox_widget.show()
-            self._log("🎙️ PTT Mode: VOX (audio-triggered)")
-        else:  # none
-            self.ptt_serial_widget.hide()
-            self.ptt_lines_widget.hide()
-            self.ptt_vox_widget.hide()
-            self._log("🎙️ PTT Mode: None (using radio's built-in VOX)")
-    
     def _get_ptt_mode(self):
-        """Get current PTT mode"""
-        if hasattr(self, 'ptt_mode_combo'):
-            return self.ptt_mode_combo.currentData()
+        """Get current PTT mode - always serial"""
         return "serial"
 
     def _set_ptt(self, on: bool):
@@ -3227,28 +3245,20 @@ class MainWindow(QMainWindow):
     
     def _ptt_test_on(self):
         """PTT test button pressed - key TX"""
-        ptt_mode = self._get_ptt_mode()
-        
-        if ptt_mode == "serial":
-            if not self.ptt_serial or not self.ptt_serial.is_open:
-                self._log("❌ PTT not connected - connect first!")
-                return
-            self._set_ptt(True)
-            self.ptt_test_btn.setText("🔴 TX ON!")
-            self.ptt_test_btn.setStyleSheet("""
-                QPushButton { background: #ff1744; color: white; font-weight: bold; border-radius: 4px; padding: 4px; }
-            """)
-            self._log("🔴 PTT TEST: TX ON")
-        else:
-            self._log("ℹ️ PTT mode is VOX or None - no manual test needed")
+        if not self.ptt_serial or not self.ptt_serial.is_open:
+            self._log("❌ PTT not connected - connect first!")
+            return
+        self._set_ptt(True)
+        self.ptt_test_btn.setText("🔴 TX ON!")
+        self.ptt_test_btn.setStyleSheet("""
+            QPushButton { background: #ff1744; color: white; font-weight: bold; border-radius: 4px; padding: 4px; }
+        """)
+        self._log("🔴 PTT TEST: TX ON")
     
     def _ptt_test_off(self):
         """PTT test button released - unkey TX"""
-        ptt_mode = self._get_ptt_mode()
-        
-        if ptt_mode == "serial":
-            self._set_ptt(False)
-            self._log("⚪ PTT TEST: TX OFF")
+        self._set_ptt(False)
+        self._log("⚪ PTT TEST: TX OFF")
         
         self.ptt_test_btn.setText("🔴 Test PTT")
         self.ptt_test_btn.setStyleSheet("""
@@ -3557,8 +3567,9 @@ class MainWindow(QMainWindow):
             self.aprs_is_server.setText(self.settings_aprs_server.text())
         if hasattr(self, 'settings_aprs_port'):
             self.aprs_is_port.setValue(self.settings_aprs_port.value())
-        if hasattr(self, 'settings_aprs_filter'):
-            self.aprs_is_filter.setText(self.settings_aprs_filter.text())
+        
+        # Build filter from radius and location
+        self.aprs_is_filter.setText(self._build_aprs_filter())
         
         # Use existing toggle method
         self.toggle_aprs_is()
@@ -4417,6 +4428,69 @@ class MainWindow(QMainWindow):
                 
         except Exception as e:
             self._log(f"❌ APRS-IS send failed: {e}")
+    
+    def _toggle_auto_beacon(self, state):
+        """Enable or disable auto-beacon"""
+        if state == Qt.CheckState.Checked.value:
+            # Start auto-beacon
+            interval_mins = self.auto_beacon_interval.value()
+            self.auto_beacon_countdown = interval_mins * 60  # Convert to seconds
+            self.auto_beacon_timer.start(1000)  # Tick every second
+            self.auto_beacon_status.setText(f"Next beacon in: {interval_mins}:00")
+            self.auto_beacon_status.setStyleSheet("color: #69f0ae;")
+            self._log(f"⏱️ Auto-beacon enabled: every {interval_mins} minutes")
+            
+            # Log to TX log
+            mode = self.auto_beacon_mode.currentData()
+            mode_str = {"is": "APRS-IS", "rf": "RF", "both": "RF + APRS-IS"}[mode]
+            self.preset_log.append(f"<br><span style='color:#ffd54f'>⏱️ Auto-beacon started: {mode_str} every {interval_mins} min</span>")
+        else:
+            # Stop auto-beacon
+            self.auto_beacon_timer.stop()
+            self.auto_beacon_status.setText("Auto-beacon: Off")
+            self.auto_beacon_status.setStyleSheet("color: #607d8b;")
+            self._log("⏱️ Auto-beacon disabled")
+            self.preset_log.append("<span style='color:#ff6b6b'>⏱️ Auto-beacon stopped</span>")
+    
+    def _update_auto_beacon_interval(self, value):
+        """Update auto-beacon interval"""
+        if self.auto_beacon_enabled.isChecked():
+            # Reset countdown to new interval
+            self.auto_beacon_countdown = value * 60
+            self._log(f"⏱️ Auto-beacon interval changed to {value} minutes")
+    
+    def _auto_beacon_tick(self):
+        """Called every second when auto-beacon is enabled"""
+        self.auto_beacon_countdown -= 1
+        
+        # Update countdown display
+        mins = self.auto_beacon_countdown // 60
+        secs = self.auto_beacon_countdown % 60
+        self.auto_beacon_status.setText(f"Next beacon in: {mins}:{secs:02d}")
+        
+        if self.auto_beacon_countdown <= 0:
+            # Time to send beacon
+            self._send_auto_beacon()
+            
+            # Reset countdown
+            self.auto_beacon_countdown = self.auto_beacon_interval.value() * 60
+    
+    def _send_auto_beacon(self):
+        """Send beacon based on auto-beacon mode"""
+        mode = self.auto_beacon_mode.currentData()
+        
+        self._log("⏱️ Auto-beacon triggered")
+        
+        if mode == "is" or mode == "both":
+            # Send via APRS-IS
+            if self.aprs_is_running and self.aprs_is_socket:
+                self._send_beacon_aprs_is()
+            else:
+                self._log("⚠️ APRS-IS not connected, skipping")
+        
+        if mode == "rf" or mode == "both":
+            # Send via RF
+            self.send_beacon()
     
     def _save_settings_from_tab(self):
         """Save settings from the settings tab"""
@@ -6014,6 +6088,13 @@ class MainWindow(QMainWindow):
             js = f"toggleCallsignLabels({str(enabled).lower()})"
             self.map.page().runJavaScript(js)
     
+    def _rx_toggle_trails(self, state):
+        """Toggle station trails visibility on map"""
+        enabled = state == Qt.CheckState.Checked.value
+        if self.map_ready:
+            js = f"toggleTrails({str(enabled).lower()})"
+            self.map.page().runJavaScript(js)
+    
     def _rx_toggle_hospitals(self, state):
         """Toggle hospitals from RX page checkbox - syncs with Settings"""
         # Sync to settings checkbox
@@ -6880,6 +6961,31 @@ class MainWindow(QMainWindow):
         
         self._toggle_aqi_monitor(Qt.CheckState.Checked.value if enabled else Qt.CheckState.Unchecked.value)
     
+    def _build_aprs_filter(self):
+        """Build APRS-IS filter string from location and radius"""
+        # Get radius from settings
+        radius = self.settings_aprs_radius.value() if hasattr(self, 'settings_aprs_radius') else 100
+        
+        # Get location - try GPS first, then manual
+        lat, lon = None, None
+        if hasattr(self, 'gps_lat') and self.gps_lat is not None:
+            lat, lon = self.gps_lat, self.gps_lon
+        elif hasattr(self, 'manual_location'):
+            manual_text = self.manual_location.text().strip()
+            if manual_text:
+                try:
+                    parts = manual_text.replace(" ", "").split(",")
+                    if len(parts) == 2:
+                        lat, lon = float(parts[0]), float(parts[1])
+                except ValueError:
+                    pass
+        
+        # Fallback to default LA coordinates
+        if lat is None or lon is None:
+            lat, lon = 34.05, -118.25
+        
+        return f"r/{lat:.2f}/{lon:.2f}/{radius}"
+    
     def toggle_aprs_is(self):
         """Connect or disconnect from APRS-IS server"""
         if self.aprs_is_running:
@@ -6909,8 +7015,9 @@ class MainWindow(QMainWindow):
                 self.aprs_is_server.setText(self.settings_aprs_server.text())
             if hasattr(self, 'settings_aprs_port'):
                 self.aprs_is_port.setValue(self.settings_aprs_port.value())
-            if hasattr(self, 'settings_aprs_filter'):
-                self.aprs_is_filter.setText(self.settings_aprs_filter.text())
+            
+            # Build filter from radius and location
+            self.aprs_is_filter.setText(self._build_aprs_filter())
             
             # Connect
             server = self.aprs_is_server.text().strip()
@@ -7692,32 +7799,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Callsign", "Please enter your callsign")
             return
         
-        # Check PTT mode first
-        ptt_mode = self._get_ptt_mode()
-        
+        # Auto-connect PTT if not connected
         ptt_auto_connected = False
-        
-        if ptt_mode == "serial":
-            # Auto-connect PTT if not connected (serial mode)
-            if not self.ptt_serial or not self.ptt_serial.is_open:
-                ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
-                if ptt_port:
-                    try:
-                        self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
-                        self._set_ptt(False)
-                        ptt_auto_connected = True
-                        self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
-                        self._update_tx_status()
-                    except Exception as e:
-                        QMessageBox.warning(self, "PTT Connection Failed", f"Could not connect PTT:\n{e}\n\nConfigure in Settings tab.")
-                        return
-                else:
-                    QMessageBox.warning(self, "PTT Not Configured", "Configure PTT port in Settings tab first")
+        if not self.ptt_serial or not self.ptt_serial.is_open:
+            ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
+            if ptt_port:
+                try:
+                    self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
+                    self._set_ptt(False)
+                    ptt_auto_connected = True
+                    self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
+                    self._update_tx_status()
+                except Exception as e:
+                    QMessageBox.warning(self, "PTT Connection Failed", f"Could not connect PTT:\n{e}\n\nConfigure in Settings tab.")
                     return
-        elif ptt_mode == "vox":
-            self.preset_log.append("🎙️ Using VOX PTT (audio-triggered)")
-        else:  # none
-            self.preset_log.append("🎙️ PTT: None (using radio's built-in VOX)")
+            else:
+                QMessageBox.warning(self, "PTT Not Configured", "Configure PTT port in Settings tab first")
+                return
         
         # Get TX audio OUTPUT device from Settings
         tx_device = self.settings_tx_audio_combo.currentData() if hasattr(self, 'settings_tx_audio_combo') else None
@@ -7857,55 +7955,24 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 raise ValueError(f"TX audio device error: {e}. Try refreshing device list.")
             
-            # Handle PTT based on mode
-            ptt_mode = self._get_ptt_mode()
-            
-            if ptt_mode == "serial":
-                # Serial RTS/DTR mode - key PTT before audio
-                ptt_line = "DTR" if self.ptt_dtr_combo.currentIndex() > 0 else "RTS"
-                self.preset_log.append(f"   🔴 PTT ON ({ptt_line} on {self.ptt_serial.port})")
-                self._set_ptt(True)
-                time.sleep(TX_LEAD_IN_MS / 1000.0)
-                self.preset_log.append(f"   Lead-in: {TX_LEAD_IN_MS}ms")
-            elif ptt_mode == "vox":
-                # VOX mode - just add lead-in tone to trigger VOX
-                vox_threshold = self.vox_threshold.value() / 100.0 if hasattr(self, 'vox_threshold') else 0.1
-                self.preset_log.append(f"   🎙️ VOX mode (threshold: {vox_threshold*100:.0f}%)")
-                # Add lead-in: short burst of tone to trigger VOX before actual data
-                lead_in_samples = int(TX_LEAD_IN_MS * playback_rate / 1000)
-                lead_in_tone = np.sin(2 * np.pi * 1200 * np.arange(lead_in_samples) / playback_rate).astype(np.float32)
-                lead_in_tone *= tx_level_pct / 100.0  # Apply TX level
-                lead_in_tone = apply_cosine_ramp(lead_in_tone, playback_rate, ramp_ms=20)
-                if len(audio_out.shape) == 2:  # Stereo
-                    lead_in_tone = np.column_stack([lead_in_tone, lead_in_tone])
-                audio_out = np.concatenate([lead_in_tone, audio_out])
-                self.preset_log.append(f"   Lead-in tone: {TX_LEAD_IN_MS}ms @ 1200Hz")
-            else:
-                # None mode - radio's VOX handles it, just add brief lead-in
-                self.preset_log.append(f"   🎙️ Using radio VOX")
-                time.sleep(0.05)  # Brief delay
+            # Key PTT before audio
+            ptt_line = "DTR" if self.ptt_dtr_combo.currentIndex() > 0 else "RTS"
+            self.preset_log.append(f"   🔴 PTT ON ({ptt_line} on {self.ptt_serial.port})")
+            self._set_ptt(True)
+            time.sleep(TX_LEAD_IN_MS / 1000.0)
+            self.preset_log.append(f"   Lead-in: {TX_LEAD_IN_MS}ms")
             
             # Play audio at correct sample rate (native or resampled)
             self.preset_log.append(f"   🔊 Sending audio at {playback_rate} Hz...")
             sd.play(audio_out, playback_rate, device=tx_device)
             sd.wait()  # Wait for playback to finish
             
-            # Handle PTT tail based on mode
-            if ptt_mode == "serial":
-                # TX tail - keep PTT on after audio finishes
-                time.sleep(TX_TAIL_MS / 1000.0)
-                self.preset_log.append(f"   Tail: {TX_TAIL_MS}ms")
-                # Unkey PTT
-                self._set_ptt(False)
-                self.preset_log.append(f"   ⚪ PTT OFF")
-            elif ptt_mode == "vox":
-                # VOX hang time is handled by the VOX circuit
-                vox_hang = self.vox_hang_time.value() if hasattr(self, 'vox_hang_time') else 500
-                self.preset_log.append(f"   VOX hang time: {vox_hang}ms")
-                time.sleep(vox_hang / 1000.0)
-            else:
-                # None mode - brief tail
-                time.sleep(TX_TAIL_MS / 1000.0)
+            # TX tail - keep PTT on after audio finishes
+            time.sleep(TX_TAIL_MS / 1000.0)
+            self.preset_log.append(f"   Tail: {TX_TAIL_MS}ms")
+            # Unkey PTT
+            self._set_ptt(False)
+            self.preset_log.append(f"   ⚪ PTT OFF")
             
             self.preset_log.append("✅ Beacon transmitted!")
             self._log("✅ Beacon TX complete")
@@ -8028,12 +8095,9 @@ class MainWindow(QMainWindow):
             "settings_gps_port": self.settings_gps_combo.currentData() if hasattr(self, 'settings_gps_combo') else None,
             "settings_gps_baud": self.gps_baud_combo.currentData() if hasattr(self, 'gps_baud_combo') else 4800,
             
-            # Settings tab - PTT mode and line settings
-            "ptt_mode": self.ptt_mode_combo.currentData() if hasattr(self, 'ptt_mode_combo') else "serial",
+            # Settings tab - PTT line settings
             "ptt_rts_mode": self.ptt_rts_combo.currentText() if hasattr(self, 'ptt_rts_combo') else "Off",
             "ptt_dtr_mode": self.ptt_dtr_combo.currentText() if hasattr(self, 'ptt_dtr_combo') else "High=TX",
-            "vox_threshold": self.vox_threshold.value() if hasattr(self, 'vox_threshold') else 10,
-            "vox_hang_time": self.vox_hang_time.value() if hasattr(self, 'vox_hang_time') else 500,
             
             # Settings tab - Audio
             "settings_rx_audio": self.settings_rx_audio_combo.currentData() if hasattr(self, 'settings_rx_audio_combo') else None,
@@ -8043,7 +8107,7 @@ class MainWindow(QMainWindow):
             # Settings tab - APRS-IS
             "settings_aprs_server": self.settings_aprs_server.text() if hasattr(self, 'settings_aprs_server') else "rotate.aprs2.net",
             "settings_aprs_port": self.settings_aprs_port.value() if hasattr(self, 'settings_aprs_port') else 14580,
-            "settings_aprs_filter": self.settings_aprs_filter.text() if hasattr(self, 'settings_aprs_filter') else "r/34.05/-118.25/100",
+            "settings_aprs_radius": self.settings_aprs_radius.value() if hasattr(self, 'settings_aprs_radius') else 100,
             "settings_aprs_passcode": self.settings_aprs_passcode.text() if hasattr(self, 'settings_aprs_passcode') else "",
             
             # Settings tab - Earthquake Monitor
@@ -8118,6 +8182,11 @@ class MainWindow(QMainWindow):
             "aprs_is_server": self.aprs_is_server.text(),
             "aprs_is_port": self.aprs_is_port.value(),
             "aprs_is_filter": self.aprs_is_filter.text(),
+            
+            # Auto-beacon settings
+            "auto_beacon_enabled": self.auto_beacon_enabled.isChecked() if hasattr(self, 'auto_beacon_enabled') else False,
+            "auto_beacon_interval": self.auto_beacon_interval.value() if hasattr(self, 'auto_beacon_interval') else 10,
+            "auto_beacon_mode": self.auto_beacon_mode.currentData() if hasattr(self, 'auto_beacon_mode') else "is",
         }
         try:
             with open(SETTINGS_FILE, "w") as f:
@@ -8245,12 +8314,7 @@ class MainWindow(QMainWindow):
                         self.settings_gps_combo.setCurrentIndex(i)
                         break
             
-            # Settings tab - PTT mode and line settings
-            if hasattr(self, 'ptt_mode_combo') and "ptt_mode" in settings:
-                for i in range(self.ptt_mode_combo.count()):
-                    if self.ptt_mode_combo.itemData(i) == settings["ptt_mode"]:
-                        self.ptt_mode_combo.setCurrentIndex(i)
-                        break
+            # Settings tab - PTT line settings
             if hasattr(self, 'ptt_rts_combo') and "ptt_rts_mode" in settings:
                 idx = self.ptt_rts_combo.findText(settings["ptt_rts_mode"])
                 if idx >= 0:
@@ -8259,10 +8323,6 @@ class MainWindow(QMainWindow):
                 idx = self.ptt_dtr_combo.findText(settings["ptt_dtr_mode"])
                 if idx >= 0:
                     self.ptt_dtr_combo.setCurrentIndex(idx)
-            if hasattr(self, 'vox_threshold') and "vox_threshold" in settings:
-                self.vox_threshold.setValue(settings["vox_threshold"])
-            if hasattr(self, 'vox_hang_time') and "vox_hang_time" in settings:
-                self.vox_hang_time.setValue(settings["vox_hang_time"])
             
             # Settings tab - Earthquake Monitor
             if hasattr(self, 'quake_radius') and "quake_radius" in settings:
@@ -8362,8 +8422,8 @@ class MainWindow(QMainWindow):
                 self.settings_aprs_server.setText(settings["settings_aprs_server"])
             if hasattr(self, 'settings_aprs_port') and "settings_aprs_port" in settings:
                 self.settings_aprs_port.setValue(settings["settings_aprs_port"])
-            if hasattr(self, 'settings_aprs_filter') and "settings_aprs_filter" in settings:
-                self.settings_aprs_filter.setText(settings["settings_aprs_filter"])
+            if hasattr(self, 'settings_aprs_radius') and "settings_aprs_radius" in settings:
+                self.settings_aprs_radius.setValue(settings["settings_aprs_radius"])
             if hasattr(self, 'settings_aprs_passcode') and "settings_aprs_passcode" in settings:
                 self.settings_aprs_passcode.setText(settings["settings_aprs_passcode"])
             
@@ -8442,6 +8502,17 @@ class MainWindow(QMainWindow):
             # Winlink settings
             if hasattr(self, 'wl_gateway_edit') and "wl_gateway" in settings:
                 self.wl_gateway_edit.setText(settings["wl_gateway"])
+            
+            # Auto-beacon settings
+            if hasattr(self, 'auto_beacon_interval') and "auto_beacon_interval" in settings:
+                self.auto_beacon_interval.setValue(settings["auto_beacon_interval"])
+            if hasattr(self, 'auto_beacon_mode') and "auto_beacon_mode" in settings:
+                idx = self.auto_beacon_mode.findData(settings["auto_beacon_mode"])
+                if idx >= 0:
+                    self.auto_beacon_mode.setCurrentIndex(idx)
+            # Note: Don't auto-enable auto-beacon on startup - user should manually enable
+            # if hasattr(self, 'auto_beacon_enabled') and "auto_beacon_enabled" in settings:
+            #     self.auto_beacon_enabled.setChecked(settings["auto_beacon_enabled"])
             
             self._log(f"📂 Loaded settings from {SETTINGS_FILE.name}")
             
@@ -8872,8 +8943,7 @@ class MainWindow(QMainWindow):
                     path_list.append((p, 0))
         
         # Check PTT
-        ptt_mode = self._get_ptt_mode()
-        if ptt_mode == "serial" and (not self.ptt_serial or not self.ptt_serial.is_open):
+        if not self.ptt_serial or not self.ptt_serial.is_open:
             ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
             if ptt_port:
                 try:
@@ -8984,9 +9054,8 @@ class MainWindow(QMainWindow):
                     audio_out = audio.astype(np.float32)
                 
                 # Key PTT
-                if ptt_mode == "serial":
-                    self._set_ptt(True)
-                    time.sleep(0.5)  # Let radio settle
+                self._set_ptt(True)
+                time.sleep(0.5)  # Let radio settle
                 
                 # Play audio
                 sd.play(audio_out, device_sr, device=tx_device)
@@ -8994,8 +9063,7 @@ class MainWindow(QMainWindow):
                 
                 # Unkey PTT
                 time.sleep(0.15)
-                if ptt_mode == "serial":
-                    self._set_ptt(False)
+                self._set_ptt(False)
                 
                 sent += 1
                 
@@ -9010,8 +9078,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"RF beacon failed:\n{e}")
         finally:
             self.tx_in_progress = False
-            if ptt_mode == "serial":
-                self._set_ptt(False)
+            self._set_ptt(False)
         
         self._log(f"📻 RF beacon complete: {sent}/{len(self.custom_locations)} sent")
         QMessageBox.information(self, "RF Beacon Complete",

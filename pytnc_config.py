@@ -142,7 +142,13 @@ TOCALL_DEVICES = {
     "API31": "Icom ID-31",
     "API51": "Icom ID-51",
     "API52": "Icom ID-52",
+    "API410": "Icom ID-4100",
+    "API510": "Icom ID-5100",
+    "API710": "Icom IC-7100",
     "API80": "Icom IC-80",
+    "API880": "Icom ID-880",
+    "API910": "Icom IC-9100",
+    "API970": "Icom IC-9700",
     "API9": "Icom IC-9100",
     "APIC": "Icom APRS",
     
@@ -193,6 +199,13 @@ TOCALL_DEVICES = {
     "APLX": "LinuxAPRS",
     "APXS": "Xastir",
     "APNX": "Xrouter",
+    
+    # === Web/Online Services ===
+    "APFI": "aprs.fi",
+    "APRS": "Generic APRS",
+    
+    # === JS8Call ===
+    "APJ8": "JS8Call",
     
     # === Weather Stations ===
     "APWX": "WX Station",
@@ -249,7 +262,7 @@ TOCALL_DEVICES = {
     "APWL2K": "Winlink 2000",
     
     # === PyTNC Pro (official TOCALL: APPR0? registered to KO6IKR) ===
-    "APPR01": "PyTNC Pro v0.1.1-beta",
+    "APPR01": "PyTNC Pro v0.1.2-beta",
     "APPR0": "PyTNC Pro",
     "APZ": "Experimental Software",
     
@@ -257,8 +270,9 @@ TOCALL_DEVICES = {
     "AP": "Unknown APRS",
 }
 
-# Mic-E device suffixes (from aprs.fi tocalls.json - official database)
+# Mic-E device suffixes (from aprs.org/aprs12/mic-e-types.txt - official spec)
 # These are the "Mv" bytes at the END of the Mic-E info field
+# ` prefix = message capable, ' prefix = tracker only
 MICE_DEVICES = {
     # Yaesu (` prefix = message capable) - "_x" suffixes
     "_ ": "Yaesu VX-8",         # _<space>
@@ -280,6 +294,9 @@ MICE_DEVICES = {
     # Anytone
     "(5": "Anytone D578UV",     # message capable
     "(8": "Anytone D878UV",     # NOT message capable (tracker)
+    # SCS GmbH modems (not message capable)
+    ":4": "SCS P4dragon DR-7400",
+    ":8": "SCS P4dragon DR-7800",
     # SQ8L
     ":2": "SQ8L VP-Tracker",
     # SainSonic
@@ -292,8 +309,9 @@ MICE_DEVICES = {
     "*v": "KissOZ Tracker",
 }
 
-# Mic-E legacy TYPE codes (first byte) - Kenwood radios
-# These use the first byte of info field, not suffix
+# Mic-E legacy TYPE codes - Kenwood radios
+# These use the SYMBOL TABLE byte (info[8]) as '>' or ']'
+# NOT the data type indicator (info[0] which is ` or ')
 MICE_LEGACY = {
     ">": "Kenwood TH-D7A",      # > alone
     ">=": "Kenwood TH-D72",     # > with = suffix

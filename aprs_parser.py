@@ -270,12 +270,12 @@ def decode_mic_e(dest: str, info: str) -> Optional[Dict[str, Any]]:
     # Detect radio type
     radio_type = None
     
-    # First check for Kenwood legacy TYPE codes (first byte of info: '>' or ']')
-    type_byte = info[0] if info else ''
-    if type_byte in ('>', ']'):
+    # Kenwood radios use '>' or ']' as the symbol TABLE byte (info[8])
+    # This is different from standard symbol tables '/' or '\'
+    if sym_table in ('>', ']'):
         # Check last byte for version indicator
         last_byte = rest[-1] if rest else ''
-        radio_type = get_device_from_mice_legacy(type_byte, last_byte)
+        radio_type = get_device_from_mice_legacy(sym_table, last_byte)
         # Remove version byte from rest if it was a Kenwood indicator
         if radio_type and last_byte in ('=', '^', '&'):
             rest = rest[:-1]
@@ -338,13 +338,15 @@ def decode_mic_e(dest: str, info: str) -> Optional[Dict[str, Any]]:
                 status_text = parts[-1].strip() if parts[-1].strip() else None
         except (ValueError, IndexError):
             # Telemetry parsing failed - try to salvage status text
-            clean_rest = ''.join(c for c in rest if c.isprintable())
+            clean_rest = ''.join(c for c in rest if c.isprintable() and ord(c) < 128)
             if clean_rest.strip():
                 status_text = clean_rest.strip()
     else:
         # No telemetry - rest might be status text
-        # Clean up the rest string - remove control characters and get printable text
-        clean_rest = ''.join(c for c in rest if c.isprintable())
+        # Clean up the rest string - remove control characters, high bytes, and get printable text
+        clean_rest = ''.join(c for c in rest if c.isprintable() and ord(c) < 128)
+        # Remove trailing Kenwood version indicators
+        clean_rest = clean_rest.rstrip('=^&')
         if clean_rest.strip():
             status_text = clean_rest.strip()
     

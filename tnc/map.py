@@ -42,10 +42,12 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       background: rgba(0,0,0,0.85); color: #fff; padding: 8px 14px;
       border-radius: 6px; font: 13px/1.4 Consolas, monospace;
       border: 2px solid #666;
+      transition: opacity 0.5s ease-out;
     }
     #status.ok { border-color: #4f4; }
     #status.error { border-color: #f44; }
     #status.warn { border-color: #fa0; }
+    #status.hidden { opacity: 0; pointer-events: none; }
     
     /* Tooltip styling */
     .leaflet-tooltip {
@@ -72,6 +74,13 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
     }
     .callsign-label::before {
       display: none !important;
+    }
+    
+    /* Station trails - thin purple line */
+    .station-trail {
+      stroke: #9c27b0;
+      stroke-opacity: 0.7;
+      stroke-width: 2;
     }
     
     /* Custom location marker - clean with alpha */
@@ -465,6 +474,12 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       var pathLines = {};
       var pendingUpdates = [];  // Queue updates during zoom
       
+      // Station trails - track history for mobile stations
+      var trails = {};           // Polylines on map
+      var trailHistory = {};     // Position history arrays
+      var showTrails = true;     // Toggle visibility
+      var MAX_TRAIL_POINTS = 30; // Max positions per station
+      
       // Digipeaters heard tracking (for stats)
       var digisHeard = {};
       
@@ -499,6 +514,14 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           var call = calls[i];
           map.removeLayer(markers[call]);
           delete markers[call];
+          // Also remove trail
+          if (trails[call]) {
+            map.removeLayer(trails[call]);
+            delete trails[call];
+          }
+          if (trailHistory[call]) {
+            delete trailHistory[call];
+          }
         }
         console.log('Pruned ' + toRemove + ' old markers');
       }
@@ -681,7 +704,118 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           });
         }
         
+        // Update station trail - only for mobile stations (SSID -9, -14, -15, etc.)
+        var ssid = call.split('-')[1] || '0';
+        var mobileSSIDs = ['9', '14', '15'];  // Car, truck, mobile
+        if (mobileSSIDs.includes(ssid)) {
+          updateTrail(call, lat, lon);
+        }
+        
         return true;
+      };
+      
+      // Update trail for a station (simplified with strict validation)
+      function updateTrail(call, lat, lon) {
+        // Strict coordinate validation
+        if (typeof lat !== 'number' || typeof lon !== 'number') return;
+        if (isNaN(lat) || isNaN(lon)) return;
+        if (lat === 0 || lon === 0) return;
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
+        
+        // Initialize trail history if needed
+        if (!trailHistory[call]) {
+          trailHistory[call] = [];
+        }
+        
+        var history = trailHistory[call];
+        var lastPos = history.length > 0 ? history[history.length - 1] : null;
+        
+        if (!lastPos) {
+          // First position - store it
+          history.push([lat, lon]);
+          return;
+        }
+        
+        var latDiff = Math.abs(lastPos[0] - lat);
+        var lonDiff = Math.abs(lastPos[1] - lon);
+        
+        // Skip if no movement
+        if (latDiff < 0.0001 && lonDiff < 0.0001) return;
+        
+        // Calculate distance in km (approximate)
+        var distKm = Math.sqrt(Math.pow(latDiff * 111, 2) + Math.pow(lonDiff * 85, 2));
+        
+        // Skip if teleport (> 5 km jump) - reset trail
+        if (distKm > 5) {
+          console.log('Trail reset for ' + call + ': jumped ' + distKm.toFixed(1) + ' km');
+          trailHistory[call] = [[lat, lon]];
+          if (trails[call]) {
+            map.removeLayer(trails[call]);
+            delete trails[call];
+          }
+          return;
+        }
+        
+        // Skip if movement is too small (< 50 meters)
+        if (distKm < 0.05) return;
+        
+        // Skip vertical/horizontal lines (GPS glitch pattern)
+        // Real driving has some angle to it
+        if (latDiff > 0.001 && lonDiff < 0.0001) {
+          console.log('Trail skip vertical for ' + call);
+          return;  // Pure north-south = suspicious
+        }
+        if (lonDiff > 0.001 && latDiff < 0.0001) {
+          console.log('Trail skip horizontal for ' + call);
+          return;  // Pure east-west = suspicious
+        }
+        
+        // Add position
+        history.push([lat, lon]);
+        
+        // Limit trail length
+        if (history.length > MAX_TRAIL_POINTS) {
+          history.shift();
+        }
+        
+        // Redraw trail
+        if (history.length >= 2 && showTrails) {
+          if (trails[call]) {
+            map.removeLayer(trails[call]);
+          }
+          trails[call] = L.polyline(history, {
+            color: '#9c27b0',
+            weight: 2,
+            opacity: 0.7
+          }).addTo(map);
+          trails[call].bringToBack();
+        }
+      }
+      
+      // Toggle trail visibility
+      window.toggleTrails = function(show) {
+        showTrails = show;
+        if (!show) {
+          // When turning off, clear all trails completely
+          Object.keys(trails).forEach(function(call) {
+            if (trails[call]) {
+              map.removeLayer(trails[call]);
+            }
+          });
+          trails = {};
+          trailHistory = {};
+        }
+      };
+      
+      // Clear all trails
+      window.clearTrails = function() {
+        Object.keys(trails).forEach(function(call) {
+          if (trails[call]) {
+            map.removeLayer(trails[call]);
+          }
+        });
+        trails = {};
+        trailHistory = {};
       };
       
       // Update digi position (when we decode their beacon)
@@ -1232,12 +1366,20 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           status.className = 'warn';
         } else if (window._tilesLoaded > 0) {
           status.textContent = 'Map OK (' + window._tilesLoaded + ' tiles)';
+          // Fade out after 3 seconds
+          setTimeout(function() {
+            status.classList.add('hidden');
+          }, 3000);
         }
       }, 5000);
       
       // Update status when tiles finish loading
       tiles.on('load', function() {
         status.textContent = 'Map OK (' + window._tilesLoaded + ' tiles)';
+        // Fade out after 3 seconds
+        setTimeout(function() {
+          status.classList.add('hidden');
+        }, 3000);
       });
       
       } // end initMap
