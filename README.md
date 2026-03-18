@@ -1,6 +1,6 @@
 # PyTNC Pro
 
-A modern, feature-rich APRS transceiver for Windows with real-time mapping, emergency communications support, and VARA FM integration. The WIKI page is live.
+A FREE modern, feature-rich APRS transceiver for Windows with real-time mapping, emergency communications support, and VARA FM integration. The WIKI page is live.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)
