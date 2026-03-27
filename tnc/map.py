@@ -316,8 +316,8 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
     .leaflet-popup-content {
       font: 12px/1.5 Consolas, monospace !important;
       margin: 10px 12px !important;
-      max-width: 320px !important;
-      min-width: 200px !important;
+      max-width: 380px !important;
+      min-width: 220px !important;
       word-wrap: break-word !important;
       overflow-wrap: break-word !important;
       white-space: normal !important;

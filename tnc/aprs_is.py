@@ -523,7 +523,7 @@ class APRSISMixin:
                     def _lnk(m):
                         u = m.group(1)
                         h = u if u.startswith('http') else f'https://{u}'
-                        return f'<a href="#" onclick="console.log(\'OPEN_EXTERNAL:{h}\');return false;" style="color:#64b5f6">{u}</a>'
+                        return f'<a href="#" onclick="console.log(\'OPEN_EXTERNAL:{h}\');return false;" style="color:#64b5f6;word-break:break-all">{u}</a>'
                     clean_comment = re.sub(url_pat, _lnk, clean_comment)
                     if clean_comment:
                         tooltip_parts.append(f"💬 {clean_comment}")
@@ -534,7 +534,7 @@ class APRSISMixin:
                         def _lnk_s(m):
                             u = m.group(1)
                             h = u if u.startswith('http') else f'https://{u}'
-                            return f'<a href="#" onclick="console.log(\'OPEN_EXTERNAL:{h}\');return false;" style="color:#64b5f6">{u}</a>'
+                            return f'<a href="#" onclick="console.log(\'OPEN_EXTERNAL:{h}\');return false;" style="color:#64b5f6;word-break:break-all">{u}</a>'
                         st = re.sub(url_pat, _lnk_s, st)
                         tooltip_parts.append(f"📝 {st}")
 
