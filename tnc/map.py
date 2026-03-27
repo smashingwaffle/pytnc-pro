@@ -314,12 +314,13 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       min-width: 200px !important;
     }
     .leaflet-popup-content {
-      font: 11px/1.5 Consolas, monospace !important;
+      font: 12px/1.5 Consolas, monospace !important;
       margin: 10px 12px !important;
       max-width: 320px !important;
+      min-width: 200px !important;
       word-wrap: break-word !important;
       overflow-wrap: break-word !important;
-      white-space: pre-wrap !important;
+      white-space: normal !important;
     }
     .leaflet-popup-tip {
       background: rgba(13,33,55,0.98) !important;
@@ -741,7 +742,7 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         } else {
           markers[call] = L.marker([lat, lon], { icon: icon })
             .addTo(map)
-            .bindPopup(popupHtml, { autoPan: false })
+            .bindPopup(popupHtml, { autoPan: true, autoPanPadding: [20, 20] })
             .bindTooltip(labelHtml, { 
               permanent: true,
               direction: 'right',
