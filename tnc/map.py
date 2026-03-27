@@ -316,7 +316,10 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
     .leaflet-popup-content {
       font: 11px/1.5 Consolas, monospace !important;
       margin: 10px 12px !important;
-      white-space: nowrap !important;
+      max-width: 320px !important;
+      word-wrap: break-word !important;
+      overflow-wrap: break-word !important;
+      white-space: pre-wrap !important;
     }
     .leaflet-popup-tip {
       background: rgba(13,33,55,0.98) !important;
@@ -458,10 +461,35 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         // Direct OSM URL as fallback
         var osmDirectUrl = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
         
-        // OpenStreetMap tiles via local proxy (primary)
-        var tiles = L.tileLayer(tileUrl, {
-          attribution: '© OpenStreetMap',
-          maxZoom: 19,
+        // Define available tile layers (only OSM uses local cache)
+        var tileLayers = {
+          osm: {
+            url: tileUrl,  // Uses local proxy/cache
+            attribution: '© OpenStreetMap',
+            maxZoom: 19
+          },
+          topo: {
+            url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+            attribution: '© OpenTopoMap',
+            maxZoom: 17
+          },
+          satellite: {
+            url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attribution: '© Esri',
+            maxZoom: 19
+          },
+          dark: {
+            url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+            attribution: '© CartoDB',
+            maxZoom: 19
+          }
+        };
+        
+        // Current active tile layer
+        var currentLayer = 'osm';
+        var tiles = L.tileLayer(tileLayers.osm.url, {
+          attribution: tileLayers.osm.attribution,
+          maxZoom: tileLayers.osm.maxZoom,
           crossOrigin: true
         });
         
@@ -474,6 +502,25 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           console.log('[TILES] Error loading:', e.coords);
         });
         tiles.addTo(map);
+        
+        // Expose layer switch function for Python/Qt
+        window.setMapLayer = function(layerName) {
+          if (tileLayers[layerName]) {
+            map.removeLayer(tiles);
+            var config = tileLayers[layerName];
+            tiles = L.tileLayer(config.url, {
+              attribution: config.attribution,
+              maxZoom: config.maxZoom,
+              crossOrigin: true
+            });
+            tiles.on('tileload', function(e) { window._tilesLoaded++; });
+            tiles.on('tileerror', function(e) { window._tileErrors++; });
+            tiles.addTo(map);
+            tiles.bringToBack();
+            currentLayer = layerName;
+            console.log('[MAP] Switched to layer:', layerName);
+          }
+        };
       
       // Station markers
       var markers = {};
@@ -504,37 +551,49 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         return iconCache[iconUrl];
       }
       
-      // Prune old station markers to keep map responsive (max 500 markers)
+      // Prune old station markers - remove anything older than 24 hours
       var MAX_STATION_MARKERS = 500;
+      var STATION_MAX_AGE_MS = 24 * 60 * 60 * 1000;  // 24 hours in ms
       function pruneOldMarkers() {
+        var now = Date.now();
         var calls = Object.keys(markers);
-        if (calls.length <= MAX_STATION_MARKERS) return;
-        
-        // Sort by last update time, oldest first
-        calls.sort(function(a, b) {
-          return (markers[a]._lastUpdate || 0) - (markers[b]._lastUpdate || 0);
-        });
-        
-        // Remove oldest markers until under limit
-        var toRemove = calls.length - MAX_STATION_MARKERS;
-        for (var i = 0; i < toRemove; i++) {
-          var call = calls[i];
-          map.removeLayer(markers[call]);
-          delete markers[call];
-          // Also remove trail
-          if (trails[call]) {
-            map.removeLayer(trails[call]);
-            delete trails[call];
+
+        // Remove stations not heard in 24 hours
+        calls.forEach(function(call) {
+          var age = now - (markers[call]._lastUpdate || 0);
+          if (age > STATION_MAX_AGE_MS) {
+            map.removeLayer(markers[call]);
+            delete markers[call];
+            if (trails[call]) {
+              map.removeLayer(trails[call]);
+              delete trails[call];
+            }
+            if (trailHistory[call]) {
+              delete trailHistory[call];
+            }
+            console.log('[MAP] Removed stale station: ' + call + ' (age: ' + Math.round(age/3600000) + 'h)');
           }
-          if (trailHistory[call]) {
-            delete trailHistory[call];
+        });
+
+        // Also enforce hard cap of 500 markers (safety net)
+        var remaining = Object.keys(markers);
+        if (remaining.length > MAX_STATION_MARKERS) {
+          remaining.sort(function(a, b) {
+            return (markers[a]._lastUpdate || 0) - (markers[b]._lastUpdate || 0);
+          });
+          var toRemove = remaining.length - MAX_STATION_MARKERS;
+          for (var i = 0; i < toRemove; i++) {
+            var call = remaining[i];
+            map.removeLayer(markers[call]);
+            delete markers[call];
+            if (trails[call]) { map.removeLayer(trails[call]); delete trails[call]; }
+            if (trailHistory[call]) { delete trailHistory[call]; }
           }
         }
-        console.log('Pruned ' + toRemove + ' old markers');
       }
-      
-      // Run pruning periodically
-      setInterval(pruneOldMarkers, 60000);  // Every minute
+
+      // Run pruning every 5 minutes
+      setInterval(pruneOldMarkers, 5 * 60 * 1000);
       
       // HTML escape function to prevent XSS from untrusted APRS data
       function escapeHtml(str) {

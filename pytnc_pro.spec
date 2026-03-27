@@ -40,6 +40,10 @@ print(f"[SPEC] Building: {APP_NAME}")
 
 # Data files to bundle
 datas = [
+    # Application icon
+    ('pytnc_pro.ico', '.'),
+    ('pytnc_pro_256.png', '.'),
+    
     # APRS symbol images (Hessu's symbols) - try both folder names
     ('hessu-symbols', 'hessu-symbols'),
     ('aprs_symbols_48', 'aprs_symbols_48'),
@@ -49,7 +53,7 @@ datas = [
     ('aprs_parser.py', '.'),
     ('ax25_parser.py', '.'),
     ('pytnc_modem.py', '.'),
-    ('true_direwolf_demod.py', '.'),
+    ('ax25_demod.py', '.'),
     ('hdlc_bitbybit.py', '.'),
     
     # TNC module
@@ -91,7 +95,7 @@ hiddenimports = [
     'aprs_parser',
     'ax25_parser',
     'pytnc_modem',
-    'true_direwolf_demod',
+    'ax25_demod',
     'hdlc_bitbybit',
 ]
 
@@ -243,7 +247,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add icon path here if you have one: icon='pytnc.ico'
+    icon='pytnc_pro.ico',  # Application icon
 )
 
 coll = COLLECT(

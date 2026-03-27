@@ -12,7 +12,7 @@ Features:
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.2-beta"
+__version__ = "0.1.3-beta"
 VERSION = __version__
 
 import sys
@@ -25,9 +25,9 @@ import threading
 import http.server
 import socket
 import socketserver
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Tuple
 from functools import partial
 import urllib.parse
 
@@ -52,18 +52,18 @@ except ImportError:
     print("Warning: pyserial not installed - PTT/GPS control disabled")
 
 from PyQt6.QtGui import QFont, QPixmap, QColor, QIcon
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, pyqtSlot, QRunnable, QThreadPool, QObject, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, pyqtSlot, QRunnable, QObject, QSize
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QTextEdit, QTextBrowser, QLabel, QGroupBox, QSplitter,
-    QProgressBar, QProgressDialog, QFrame, QGridLayout, QSlider, QMessageBox, QTabWidget,
+    QProgressBar, QFrame, QGridLayout, QSlider, QMessageBox, QTabWidget,
     QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFileDialog,
     QListWidget, QListWidgetItem, QSizePolicy
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
 
-from true_direwolf_demod import TrueDirewolfAFSK
+from ax25_demod import AX25Demodulator
 from hdlc_bitbybit import BitByBitHDLC
 from ax25_parser import AX25Parser
 
@@ -73,7 +73,7 @@ from pytnc_config import (
     SETTINGS_FILE, LUT_FILENAME,
     SAMPLE_RATE, TX_SAMPLE_RATE, HTTP_PORT,
     TOCALL_DEVICES, get_device_from_tocall,
-    MIC_E_RADIOS, MIC_E_MSG_TYPES, MIC_E_DEST_TABLE, SSID_TYPES, TILE_CACHE_DIR, USER_DATA_DIR, BUNDLE_DIR
+    TILE_CACHE_DIR, USER_DATA_DIR, BUNDLE_DIR
 )
 
 
@@ -82,8 +82,12 @@ from pytnc_config import (
 # =============================================================================
 
 from tnc import AFSKModulator, APRSPacketBuilder, apply_cosine_ramp
-from tnc.vara import VARAFMInterface, send_aprs_beacon_vara
+from tnc.vara import VARAFMInterface
 from tnc.map import write_map_html
+from tnc.ptt import PTTMixin
+from tnc.igate import IGateMixin
+from tnc.aprs_is import APRSISMixin
+from tnc.monitors import MonitorsMixin
 
 # Alias for compatibility
 VARAInterface = VARAFMInterface
@@ -313,7 +317,7 @@ def start_http_server(port: int) -> socketserver.TCPServer:
     return server
 
 
-from aprs_parser import parse_weather, parse_nmea, decode_mic_e, aprs_classify
+from aprs_parser import parse_nmea, aprs_classify
 
 
 # =============================================================================
@@ -504,6 +508,13 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     # First, remove non-printable and non-ASCII characters (telemetry garbage)
     text = ''.join(c for c in text if c.isprintable() and ord(c) < 128)
     
+    # Detect binary garbage — if more than 30% of chars are non-alphanumeric/non-space
+    # it's likely a binary payload that decoded as latin-1 garbage
+    if len(text) > 8:
+        alpha_count = sum(1 for c in text if c.isalnum() or c in ' .,!?-_/:()')
+        if alpha_count / len(text) < 0.4:
+            return ""
+    
     # Remove altitude data: /A=xxxxxx (exactly 6 digits per APRS spec, optional leading slash)
     text = re.sub(r'/?A=-?\d{6}', '', text)
     
@@ -540,8 +551,8 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     # Collapse whitespace and strip
     text = ' '.join(text.split())
     
-    # Remove potentially dangerous chars for HTML
-    text = text.replace("'", "").replace('"', '').replace('<', '&lt;').replace('>', '&gt;')
+    # Remove potentially dangerous chars for HTML (just strip them)
+    text = text.replace("'", "").replace('"', '').replace('<', '').replace('>', '')
     
     # If what remains is very short or just numbers/punctuation, discard it
     if len(text) < 3 or not re.search(r'[a-zA-Z]{2}', text):
@@ -576,7 +587,7 @@ class AudioReceiver(QThread):
         self.device_id = device_id
         self.gain = gain
         self.running = False
-        self.demod = TrueDirewolfAFSK(SAMPLE_RATE, 1200, 1200, 2200, "A")
+        self.demod = AX25Demodulator(SAMPLE_RATE, 1200, 1200, 2200, "A")
         self.hdlc = [BitByBitHDLC(0, 0, i, self.demod) for i in range(self.demod.num_slicers)]
         for h in self.hdlc:
             h.set_frame_callback(self._on_frame)
@@ -771,7 +782,7 @@ class LogPage(QWebEnginePage):
         return True
 
 
-class MainWindow(QMainWindow):
+class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
     # Signals for thread-safe UI updates
     aprs_is_connected_signal = pyqtSignal()
     aprs_is_disconnected_signal = pyqtSignal()
@@ -818,8 +829,13 @@ class MainWindow(QMainWindow):
         # Format: {callsign: {"parm": [...], "unit": [...], "eqns": [...]}}
         self.telem_defs = {}
         
-        # PTT serial connection (for RTS PTT control)
+        # PTT serial connection (for RTS/DTR PTT control)
         self.ptt_serial = None
+        # CI-V CAT serial connection (for Icom CI-V PTT)
+        self.civ_serial = None
+        self.civ_ptt_method = "RTS/DTR"  # "RTS/DTR", "CI-V CAT", or "CM108 GPIO"
+        # CM108 GPIO PTT (DigiRig Lite / USB audio dongles)
+        self.cm108_device = None   # open hid device handle
         
         # GPS serial connection
         self.gps_serial = None
@@ -835,6 +851,16 @@ class MainWindow(QMainWindow):
         self.aprs_is_thread = None
         self.aprs_is_running = False
         self.aprs_is_connected = False  # Connection status flag for UI
+
+        # IGate state
+        self.igate_rx_enabled = False   # RF → Internet
+        self.igate_tx_enabled = False   # Internet → RF (off by default)
+        self.igate_rx_count = 0
+        self.igate_tx_count = 0
+        self.igate_start_time = None
+        self.igate_rf_heard = {}        # {callsign: timestamp} for TX gate eligibility
+        self.igate_recent = []          # recent gated packets for display (max 200)
+        self.igate_dedup = {}           # {(src, info): timestamp} gate-side dedup
         
         # VARA FM connection
         self.vara_connected = False
@@ -929,6 +955,18 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         self.setWindowTitle(f"PyTNC Pro v{VERSION} - APRS Transceiver")
         self.setGeometry(50, 50, 1400, 850)
+        
+        # Set application icon
+        icon_paths = [
+            Path(__file__).parent / "pytnc_pro.ico",
+            Path(__file__).parent / "pytnc_pro_256.png",
+            Path(sys.executable).parent / "pytnc_pro.ico",
+            Path(sys.executable).parent / "pytnc_pro_256.png",
+        ]
+        for icon_path in icon_paths:
+            if icon_path.exists():
+                self.setWindowIcon(QIcon(str(icon_path)))
+                break
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -1255,17 +1293,31 @@ class MainWindow(QMainWindow):
         """)
         map_refresh_btn.clicked.connect(self._refresh_map)
         map_ctrl_row.addWidget(map_refresh_btn)
-        
-        # Tile server switcher
-        self.tile_combo = QComboBox()
-        self.tile_combo.addItem("OSM", 0)
-        self.tile_combo.addItem("OSM-DE", 1)
-        self.tile_combo.addItem("Carto", 2)
-        self.tile_combo.setFixedWidth(70)
-        self.tile_combo.setToolTip("Switch tile server if map doesn't load")
-        self.tile_combo.currentIndexChanged.connect(self._switch_tiles)
-        map_ctrl_row.addWidget(self.tile_combo)
-        
+
+        # Map layer switcher
+        self.map_layer_combo = QComboBox()
+        self.map_layer_combo.addItem("🗺️ Street", "osm")
+        self.map_layer_combo.addItem("⛰️ Topo", "topo")
+        self.map_layer_combo.addItem("🛰️ Satellite", "satellite")
+        self.map_layer_combo.addItem("🌙 Dark", "dark")
+        self.map_layer_combo.setFixedHeight(24)
+        self.map_layer_combo.setToolTip("Map Style")
+        self.map_layer_combo.setStyleSheet("""
+            QComboBox {
+                background: #0d2137; color: #e0e0e0;
+                border: 2px solid #42a5f5; border-radius: 4px;
+                padding: 0 8px; font-size: 11px;
+            }
+            QComboBox:hover { border-color: #ffd54f; }
+            QComboBox::drop-down { border: none; width: 18px; }
+            QComboBox QAbstractItemView {
+                background: #1a1a2e; color: #fff;
+                selection-background-color: #1565c0;
+            }
+        """)
+        self.map_layer_combo.currentIndexChanged.connect(self._on_map_layer_changed)
+        map_ctrl_row.addWidget(self.map_layer_combo)
+
         # Load Locations button
         self.load_locations_btn = QPushButton("📍 Locations")
         self.load_locations_btn.setFixedHeight(24)
@@ -1400,7 +1452,7 @@ class MainWindow(QMainWindow):
         
         # Tab 2: Settings & Beacon
         self._build_settings_tab()
-        
+
         layout.addWidget(self.tabs, 1)  # stretch factor 1 = fill remaining space
         
         # Main window dark cobalt blue theme
@@ -1713,7 +1765,7 @@ class MainWindow(QMainWindow):
         # RF button
         self.beacon_btn = QPushButton("📡 Send via RF")
         self.beacon_btn.setMinimumHeight(40)
-        self.beacon_btn.setToolTip("Send beacon via audio/RF (Direwolf style)")
+        self.beacon_btn.setToolTip("Send beacon via audio/RF")
         self.beacon_btn.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -1797,6 +1849,30 @@ class MainWindow(QMainWindow):
         self.symbol_table_picker.addItems(["/ Primary", "\\ Secondary"])
         self.symbol_table_picker.currentIndexChanged.connect(self._update_symbol_grid)
         table_layout.addWidget(self.symbol_table_picker)
+
+        # Overlay character field
+        table_layout.addSpacing(12)
+        overlay_lbl = QLabel("Overlay:")
+        overlay_lbl.setStyleSheet("color: #b0bec5; font-size: 11px;")
+        table_layout.addWidget(overlay_lbl)
+        self.symbol_overlay_edit = QLineEdit()
+        self.symbol_overlay_edit.setMaxLength(1)
+        self.symbol_overlay_edit.setPlaceholderText("A-Z")
+        self.symbol_overlay_edit.setFixedWidth(36)
+        self.symbol_overlay_edit.setToolTip(
+            "Optional overlay letter (A-Z, 0-9)\n"
+            "Example: I = IGate, D = Digipeater, W = Winlink\n"
+            "Leave blank for standard primary/secondary symbol"
+        )
+        self.symbol_overlay_edit.setStyleSheet("""
+            QLineEdit {
+                background: #0a1929; color: #ffd54f; font-weight: bold;
+                border: 1px solid #42a5f5; border-radius: 3px;
+                padding: 2px 4px; font-size: 13px; text-align: center;
+            }
+        """)
+        self.symbol_overlay_edit.textChanged.connect(self._on_overlay_changed)
+        table_layout.addWidget(self.symbol_overlay_edit)
         table_layout.addStretch()
         right_layout.addLayout(table_layout)
         
@@ -1880,7 +1956,12 @@ class MainWindow(QMainWindow):
         # VARA FM TAB 
         # =====================================================================
         self._build_vara_tab()
-        
+
+        # =====================================================================
+        # IGATE TAB
+        # =====================================================================
+        self._build_igate_tab()
+
         # =====================================================================
         # INFO TAB - Links & Resources
         # =====================================================================
@@ -2207,7 +2288,24 @@ class MainWindow(QMainWindow):
         ptt_layout = QGridLayout(ptt_grp)
         ptt_layout.setSpacing(4)
         
-        # Row 0: Serial port settings
+        # Row 0: PTT Method selector
+        ptt_method_widget = QWidget()
+        ptt_method_layout = QHBoxLayout(ptt_method_widget)
+        ptt_method_layout.setContentsMargins(0, 0, 0, 0)
+        ptt_method_layout.addWidget(QLabel("Method:"))
+        self.ptt_method_combo = QComboBox()
+        self.ptt_method_combo.addItems(["RTS/DTR", "CI-V CAT", "CM108 GPIO"])
+        self.ptt_method_combo.setToolTip(
+            "RTS/DTR: standard serial PTT (DigiRig Mobile, etc.)\n"
+            "CI-V CAT: Icom radio CAT control (IC-7100, IC-9700, etc.)\n"
+            "CM108 GPIO: USB audio chip GPIO (DigiRig Lite, no COM port)"
+        )
+        self.ptt_method_combo.currentTextChanged.connect(self._on_ptt_method_changed)
+        ptt_method_layout.addWidget(self.ptt_method_combo)
+        ptt_method_layout.addStretch()
+        ptt_layout.addWidget(ptt_method_widget, 0, 0, 1, 4)
+
+        # Row 1: Serial port settings (RTS/DTR mode)
         self.ptt_serial_widget = QWidget()
         ptt_serial_layout = QHBoxLayout(self.ptt_serial_widget)
         ptt_serial_layout.setContentsMargins(0, 0, 0, 0)
@@ -2221,9 +2319,9 @@ class MainWindow(QMainWindow):
         ptt_serial_layout.addWidget(self.settings_ptt_btn)
         self.settings_ptt_status = QLabel("⚫")
         ptt_serial_layout.addWidget(self.settings_ptt_status)
-        ptt_layout.addWidget(self.ptt_serial_widget, 0, 0, 1, 4)
-        
-        # Row 1: PTT Line settings - separate RTS and DTR
+        ptt_layout.addWidget(self.ptt_serial_widget, 1, 0, 1, 4)
+
+        # Row 2: RTS/DTR line settings
         self.ptt_lines_widget = QWidget()
         ptt_lines_layout = QHBoxLayout(self.ptt_lines_widget)
         ptt_lines_layout.setContentsMargins(0, 0, 0, 0)
@@ -2236,7 +2334,85 @@ class MainWindow(QMainWindow):
         self.ptt_dtr_combo.addItems(["Off", "High=TX", "Low=TX"])
         self.ptt_dtr_combo.setCurrentIndex(1)  # Default DTR High=TX
         ptt_lines_layout.addWidget(self.ptt_dtr_combo)
-        ptt_layout.addWidget(self.ptt_lines_widget, 1, 0, 1, 4)
+        ptt_layout.addWidget(self.ptt_lines_widget, 2, 0, 1, 4)
+
+        # Row 3: CI-V CAT config widget (hidden by default)
+        self.civ_widget = QWidget()
+        civ_layout = QGridLayout(self.civ_widget)
+        civ_layout.setContentsMargins(0, 4, 0, 0)
+        civ_layout.setSpacing(4)
+
+        # Row 3a: Port + Baud + Connect
+        civ_layout.addWidget(QLabel("CI-V Port:"), 0, 0)
+        self.civ_port_combo = QComboBox()
+        self._populate_serial_combo(self.civ_port_combo)
+        civ_layout.addWidget(self.civ_port_combo, 0, 1)
+        self.civ_baud_combo = QComboBox()
+        self.civ_baud_combo.addItems(["4800", "9600", "19200", "38400"])
+        self.civ_baud_combo.setCurrentText("19200")
+        self.civ_baud_combo.setFixedWidth(70)
+        self.civ_baud_combo.setToolTip("Baud rate — IC-7100 default: 19200")
+        civ_layout.addWidget(self.civ_baud_combo, 0, 2)
+        self.civ_connect_btn = QPushButton("Connect")
+        self.civ_connect_btn.setFixedWidth(70)
+        self.civ_connect_btn.clicked.connect(self._toggle_civ)
+        civ_layout.addWidget(self.civ_connect_btn, 0, 3)
+        self.civ_status = QLabel("⚫")
+        civ_layout.addWidget(self.civ_status, 0, 4)
+
+        # Row 3b: Data bits, Parity, Stop bits, CI-V address
+        civ_layout.addWidget(QLabel("Data:"), 1, 0)
+        self.civ_data_combo = QComboBox()
+        self.civ_data_combo.addItems(["8", "7"])
+        self.civ_data_combo.setFixedWidth(44)
+        civ_layout.addWidget(self.civ_data_combo, 1, 1)
+        self.civ_parity_combo = QComboBox()
+        self.civ_parity_combo.addItems(["None", "Even", "Odd"])
+        self.civ_parity_combo.setFixedWidth(60)
+        self.civ_parity_combo.setToolTip("Parity — Icom default: None")
+        civ_layout.addWidget(self.civ_parity_combo, 1, 2)
+        self.civ_stop_combo = QComboBox()
+        self.civ_stop_combo.addItems(["1", "2"])
+        self.civ_stop_combo.setFixedWidth(44)
+        self.civ_stop_combo.setToolTip("Stop bits — Icom default: 1")
+        civ_layout.addWidget(self.civ_stop_combo, 1, 3)
+
+        civ_addr_widget = QWidget()
+        civ_addr_layout = QHBoxLayout(civ_addr_widget)
+        civ_addr_layout.setContentsMargins(0, 0, 0, 0)
+        civ_addr_layout.addWidget(QLabel("CI-V Addr (hex):"))
+        self.civ_addr_edit = QLineEdit("88")
+        self.civ_addr_edit.setFixedWidth(40)
+        self.civ_addr_edit.setMaxLength(2)
+        self.civ_addr_edit.setToolTip("CI-V address in hex — IC-7100: 88, IC-9700: A2, IC-7300: 94")
+        civ_addr_layout.addWidget(self.civ_addr_edit)
+        civ_addr_layout.addStretch()
+        civ_layout.addWidget(civ_addr_widget, 1, 4)
+
+        self.civ_widget.hide()
+        ptt_layout.addWidget(self.civ_widget, 3, 0, 1, 4)
+
+        # Row 4: CM108 GPIO config widget (hidden by default)
+        self.cm108_widget = QWidget()
+        cm108_layout = QHBoxLayout(self.cm108_widget)
+        cm108_layout.setContentsMargins(0, 4, 0, 0)
+        cm108_layout.setSpacing(6)
+        cm108_layout.addWidget(QLabel("Device:"))
+        self.cm108_device_combo = QComboBox()
+        self.cm108_device_combo.setToolTip("CM108/CM119 HID device — click Scan to detect")
+        cm108_layout.addWidget(self.cm108_device_combo, 1)
+        self.cm108_scan_btn = QPushButton("🔍 Scan")
+        self.cm108_scan_btn.setFixedWidth(64)
+        self.cm108_scan_btn.clicked.connect(self._cm108_scan)
+        cm108_layout.addWidget(self.cm108_scan_btn)
+        self.cm108_connect_btn = QPushButton("Connect")
+        self.cm108_connect_btn.setFixedWidth(70)
+        self.cm108_connect_btn.clicked.connect(self._toggle_cm108)
+        cm108_layout.addWidget(self.cm108_connect_btn)
+        self.cm108_status = QLabel("⚫")
+        cm108_layout.addWidget(self.cm108_status)
+        self.cm108_widget.hide()
+        ptt_layout.addWidget(self.cm108_widget, 4, 0, 1, 4)
         
         # Row 2: Test PTT button
         self.ptt_test_btn = QPushButton("🔴 Test PTT")
@@ -2247,7 +2423,7 @@ class MainWindow(QMainWindow):
         """)
         self.ptt_test_btn.pressed.connect(self._ptt_test_on)
         self.ptt_test_btn.released.connect(self._ptt_test_off)
-        ptt_layout.addWidget(self.ptt_test_btn, 4, 0, 1, 4)
+        ptt_layout.addWidget(self.ptt_test_btn, 5, 0, 1, 4)
         left_col.addWidget(ptt_grp)
         
         # === GPS PORT ===
@@ -2763,10 +2939,10 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self._refresh_settings_ports)
         right_col.addWidget(refresh_btn)
         
-        save_btn = QPushButton("💾 Save Settings")
-        save_btn.setStyleSheet(self._button_style("#f57c00", "#ff9800"))
-        save_btn.clicked.connect(self._save_settings_from_tab)
-        right_col.addWidget(save_btn)
+        self.settings_save_btn = QPushButton("💾 Save Settings")
+        self.settings_save_btn.setStyleSheet(self._button_style("#f57c00", "#ff9800"))
+        self.settings_save_btn.clicked.connect(self._save_settings_from_tab)
+        right_col.addWidget(self.settings_save_btn)
         
         right_col.addStretch()
         main_layout.addLayout(right_col)
@@ -2796,6 +2972,10 @@ class MainWindow(QMainWindow):
         # Settings tab widget stored for adding in correct order
         self._settings_tab_widget = settings_outer
     
+    # =========================================================================
+    # IGate Tab
+    # =========================================================================
+
     def _build_vara_tab(self):
         """Build VARA FM tab"""
         # =====================================================================
@@ -3188,97 +3368,6 @@ class MainWindow(QMainWindow):
         """Update Beacon tab TX audio status when combo changes"""
         self._sync_beacon_connection_status()
     
-    def _toggle_ptt(self):
-        """Toggle PTT connection"""
-        if self.ptt_serial and self.ptt_serial.is_open:
-            # Make sure PTT is off before closing
-            self._set_ptt(False)
-            self.ptt_serial.close()
-            self.ptt_serial = None
-            self.settings_ptt_btn.setText("Connect")
-            self.settings_ptt_status.setText("⚫")
-            self.settings_ptt_status.setStyleSheet("color: #607d8b;")
-            self._sync_beacon_connection_status()
-        else:
-            port = self.settings_ptt_combo.currentData()
-            if port:
-                try:
-                    self.ptt_serial = serial.Serial(port, 9600, timeout=0.1)
-                    self._set_ptt(False)  # Initialize PTT off
-                    self.settings_ptt_btn.setText("Disconnect")
-                    self.settings_ptt_status.setText("🟢")
-                    self.settings_ptt_status.setStyleSheet("color: #69f0ae;")
-                    self._sync_beacon_connection_status()
-                except Exception as e:
-                    self.settings_ptt_status.setText("🔴")
-                    self.settings_ptt_status.setStyleSheet("color: #ef5350;")
-                    self._log(f"❌ PTT error: {e}")
-    
-    def _get_ptt_mode(self):
-        """Get current PTT mode - always serial"""
-        return "serial"
-
-    def _set_ptt(self, on: bool):
-        """Set PTT state based on RTS/DTR settings"""
-        if not self.ptt_serial or not self.ptt_serial.is_open:
-            return
-        
-        # Get RTS setting: "Off", "High=TX", "Low=TX"
-        rts_mode = self.ptt_rts_combo.currentText() if hasattr(self, 'ptt_rts_combo') else "Off"
-        dtr_mode = self.ptt_dtr_combo.currentText() if hasattr(self, 'ptt_dtr_combo') else "High=TX"
-        
-        # Set RTS
-        if rts_mode == "High=TX":
-            self.ptt_serial.rts = on
-        elif rts_mode == "Low=TX":
-            self.ptt_serial.rts = not on
-        else:  # Off
-            self.ptt_serial.rts = False
-        
-        # Set DTR
-        if dtr_mode == "High=TX":
-            self.ptt_serial.dtr = on
-        elif dtr_mode == "Low=TX":
-            self.ptt_serial.dtr = not on
-        else:  # Off
-            self.ptt_serial.dtr = False
-        
-        # Update APRS tab PTT status to show TX state
-        if hasattr(self, 'tx_ptt_status'):
-            if on:
-                self.tx_ptt_status.setText("🔴 PTT: TX")
-                self.tx_ptt_status.setStyleSheet("color: #ff1744; font-weight: bold;")
-            else:
-                self.tx_ptt_status.setText("🟢 PTT: Connected")
-                self.tx_ptt_status.setStyleSheet("color: #69f0ae;")
-            # Force UI to update immediately
-            from PyQt6.QtWidgets import QApplication
-            QApplication.processEvents()
-    
-    def _ptt_test_on(self):
-        """PTT test button pressed - key TX"""
-        if not self.ptt_serial or not self.ptt_serial.is_open:
-            self._log("❌ PTT not connected - connect first!")
-            return
-        self._set_ptt(True)
-        self.ptt_test_btn.setText("🔴 TX ON!")
-        self.ptt_test_btn.setStyleSheet("""
-            QPushButton { background: #ff1744; color: white; font-weight: bold; border-radius: 4px; padding: 4px; }
-        """)
-        self._log("🔴 PTT TEST: TX ON")
-    
-    def _ptt_test_off(self):
-        """PTT test button released - unkey TX"""
-        self._set_ptt(False)
-        self._log("⚪ PTT TEST: TX OFF")
-        
-        self.ptt_test_btn.setText("🔴 Test PTT")
-        self.ptt_test_btn.setStyleSheet("""
-            QPushButton { background: #c62828; color: white; font-weight: bold; border-radius: 4px; padding: 4px; }
-            QPushButton:hover { background: #e53935; }
-            QPushButton:pressed { background: #b71c1c; }
-        """)
-    
     def _toggle_gps(self):
         """Toggle GPS connection"""
         if hasattr(self, 'gps_serial') and self.gps_serial and self.gps_serial.is_open:
@@ -3383,6 +3472,8 @@ class MainWindow(QMainWindow):
     
     def _update_gps_position(self, lat: float, lon: float):
         """Update position from GPS (called from main thread via signal)"""
+        first_fix = not getattr(self, 'gps_has_fix', False)
+
         # Store GPS coordinates in instance variables
         self.gps_lat = lat
         self.gps_lon = lon
@@ -3390,6 +3481,12 @@ class MainWindow(QMainWindow):
         
         self.lat_edit.setValue(lat)
         self.lon_edit.setValue(lon)
+        
+        # Center map only on the first GPS fix — don't hijack the map on every update
+        if first_fix and hasattr(self, 'map'):
+            self.map.page().runJavaScript(
+                f"if(typeof setCenter === 'function') setCenter({lat}, {lon}, 13);"
+            )
         
         # Also sync to VARA FM tab
         if hasattr(self, 'vara_lat_edit'):
@@ -3548,6 +3645,12 @@ class MainWindow(QMainWindow):
                     self._log(f"📍 Location set: {lat:.6f}, {lon:.6f}")
                     self.manual_location.setStyleSheet("background: #1a5a3c;")  # Green tint
                     QTimer.singleShot(1000, lambda: self.manual_location.setStyleSheet(""))
+
+                    # Center map on manually set position
+                    if hasattr(self, 'map'):
+                        self.map.page().runJavaScript(
+                            f"if(typeof setCenter === 'function') setCenter({lat}, {lon}, 13);"
+                        )
                     
                     # Update source indicator on Beacon tab
                     if hasattr(self, 'gps_source_label'):
@@ -3572,34 +3675,6 @@ class MainWindow(QMainWindow):
         except ValueError:
             self._log("❌ Invalid number format")
     
-    def _toggle_aprs_is_from_settings(self):
-        """Toggle APRS-IS connection from settings tab"""
-        # Sync settings to main controls first
-        if hasattr(self, 'settings_aprs_server'):
-            self.aprs_is_server.setText(self.settings_aprs_server.text())
-        if hasattr(self, 'settings_aprs_port'):
-            self.aprs_is_port.setValue(self.settings_aprs_port.value())
-        
-        # Build filter from radius and location
-        self.aprs_is_filter.setText(self._build_aprs_filter())
-        
-        # Use existing toggle method
-        self.toggle_aprs_is()
-        
-        # Update settings tab status based on result
-        if self.aprs_is_running:
-            self.settings_aprs_status.setText("🟢 Connected")
-            self.settings_aprs_status.setStyleSheet("color: #69f0ae;")
-            self.settings_aprs_connect_btn.setText("Disconnect")
-        else:
-            self.settings_aprs_status.setText("⚫ Disconnected")
-            self.settings_aprs_status.setStyleSheet("color: #ef5350;")
-            self.settings_aprs_connect_btn.setText("Connect")
-    
-    # =========================================================================
-    # VARA FM Functions
-    # =========================================================================
-    
     def _vara_log(self, msg):
         """Log message to VARA FM log display AND Beacon tab TX Log"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -3620,39 +3695,6 @@ class MainWindow(QMainWindow):
         else:
             self.vara_tx_indicator.setText("● RX")
             self.vara_tx_indicator.setStyleSheet("color: #69f0ae; font-weight: bold;")
-    
-    def _vara_send_chat(self):
-        """Send chat message over VARA FM connection"""
-        if not self.vara_connected or not self.vara_data_socket:
-            self._vara_log("❌ Not connected!")
-            return
-        
-        msg = self.vara_send_edit.text().strip()
-        if not msg:
-            return
-        
-        try:
-            mycall = self.callsign_edit.text().strip().upper() or "MYCALL"
-            # Send message with newline
-            data = (msg + "\r\n").encode()
-            self.vara_data_socket.send(data)
-            self.vara_bytes_sent += len(data)
-            
-            # Display in chat with our callsign
-            self.vara_chat.append(f"<span style='color:#64b5f6'>>{mycall}</span>")
-            self.vara_chat.append(f"<span style='color:#ffffff'>{msg}</span>")
-            
-            # Update byte counter
-            self.vara_bytes_label.setText(f"📤 {self.vara_bytes_sent} bytes")
-            
-            self.vara_send_edit.clear()
-            self._vara_update_tx_indicator(True)
-            
-            # Reset to RX after short delay
-            QTimer.singleShot(500, lambda: self._vara_update_tx_indicator(False))
-            
-        except Exception as e:
-            self._vara_log(f"❌ Send error: {e}")
     
     def _vara_send_beacon(self):
         """Send APRS beacon via VARA FM - supports KISS broadcast or Connected mode"""
@@ -4016,10 +4058,6 @@ class MainWindow(QMainWindow):
         self._log(f"📥 VARA RX: {msg}")
     
     @pyqtSlot(str)
-    def _log_vara_rx(self, msg):
-        """Thread-safe logging for VARA RX (called via QMetaObject)"""
-        self._log(msg)
-    
     @pyqtSlot(str, str, str)
     def _process_vara_aprs(self, src_call: str, dest_call: str, info: str):
         """Parse APRS packet from VARA FM and add to map"""
@@ -4344,9 +4382,17 @@ class MainWindow(QMainWindow):
         # Get beacon data
         callsign = self.callsign_edit.text().strip().upper()
         ssid = self.ssid_combo.currentData()
-        symbol_table = self.symbol_table_combo.currentText()
         symbol_code = self.symbol_code_edit.text() or ">"
         comment = self.comment_edit.text().strip()
+
+        # Overlay char replaces table byte if set
+        overlay = ""
+        if hasattr(self, 'symbol_overlay_edit'):
+            overlay = self.symbol_overlay_edit.text().strip().upper()
+        if overlay and (overlay.isalpha() or overlay.isdigit()):
+            symbol_table = overlay  # e.g. "I" for IGate, "D" for Digi
+        else:
+            symbol_table = self.symbol_table_combo.currentText()
         
         # GET COORDINATES: GPS if has fix, otherwise manual from Settings
         lat = None
@@ -4660,73 +4706,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log(f"⚠️ Failed to save conversations: {e}")
     
-    def _send_message(self):
-        """Send an APRS message"""
-        to_call = self.msg_to_edit.text().strip().upper()
-        message = self.msg_text_edit.text().strip()
-        
-        if not to_call:
-            self.msg_status.setText("❌ Enter destination callsign")
-            self.msg_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        if not message:
-            self.msg_status.setText("❌ Enter a message")
-            self.msg_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        my_call = self.callsign_edit.text().strip().upper()
-        my_ssid = self.ssid_combo.currentData()
-        full_call = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
-        
-        if not my_call or my_call == "N0CALL":
-            self.msg_status.setText("❌ Set your callsign in Transmit tab")
-            self.msg_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        # Generate message sequence number
-        self.msg_seq = (self.msg_seq + 1) % 100000
-        seq_str = f"{self.msg_seq}"
-        
-        # Format: :DEST_CALL:message{seq
-        # Destination must be 9 chars, padded with spaces
-        dest_padded = f"{to_call:9s}"
-        info = f":{dest_padded}:{message}{{{seq_str}"
-        
-        # Store the message
-        if to_call not in self.conversations:
-            self.conversations[to_call] = []
-        
-        import datetime
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        
-        self.conversations[to_call].append({
-            "from": full_call,
-            "to": to_call,
-            "text": message,
-            "time": now,
-            "acked": False,
-            "seq": seq_str
-        })
-        
-        self.current_conv = to_call
-        self._update_conversation_list()
-        self._refresh_message_history()
-        
-        # Clear input
-        self.msg_text_edit.clear()
-        
-        # Send via RF if PTT is connected
-        if self.ptt_serial and self.ptt_serial.is_open:
-            self._send_message_rf(full_call, info)
-        else:
-            # Send via APRS-IS if connected
-            if hasattr(self, 'aprs_is_socket') and self.aprs_is_socket:
-                self._send_message_is(full_call, to_call, info)
-            else:
-                self.msg_status.setText("⚠️ Message queued (no TX/APRS-IS)")
-                self.msg_status.setStyleSheet("color: #ffb74d;")
-    
     def _send_message_rf(self, from_call, info):
         """Send message via RF"""
         self.msg_status.setText("📡 Sending via RF...")
@@ -5000,24 +4979,62 @@ class MainWindow(QMainWindow):
     
     def _symbol_clicked(self, table: str, code: str, name: str):
         """Handle symbol button click"""
-        # Update beacon settings
-        table_idx = 0 if table == "/" else 1
-        self.symbol_table_combo.setCurrentIndex(table_idx)
-        self.symbol_code_edit.setText(code)
-        
-        # Update the symbol preview in beacon settings
-        prefix = "primary" if table == "/" else "secondary"
+        # Check if overlay is set - overlay char replaces table byte
+        overlay = ""
+        if hasattr(self, 'symbol_overlay_edit'):
+            overlay = self.symbol_overlay_edit.text().strip().upper()
+            if overlay and (overlay.isalpha() or overlay.isdigit()):
+                # Overlay mode: table byte = overlay char, use secondary icons
+                self.symbol_table_combo.setCurrentIndex(1)  # secondary
+                self.symbol_code_edit.setText(code)
+                # Store overlay char as table value
+                self.symbol_table_combo.setCurrentText(overlay)
+            else:
+                table_idx = 0 if table == "/" else 1
+                self.symbol_table_combo.setCurrentIndex(table_idx)
+                self.symbol_code_edit.setText(code)
+        else:
+            table_idx = 0 if table == "/" else 1
+            self.symbol_table_combo.setCurrentIndex(table_idx)
+            self.symbol_code_edit.setText(code)
+
+        # Update the symbol preview
+        prefix = "secondary" if (table == "\\" or overlay) else "primary"
         hessu_num = ord(code) - 33
-        icon_path = HESSU_SYMBOLS_DIR / prefix / f"{hessu_num:02d}.png"
-        
-        if icon_path.exists():
-            self.symbol_preview.setPixmap(QPixmap(str(icon_path)).scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        
-        self.preset_log.append(f"🎨 Selected symbol: {table}{code} - {name}")
-        
-        # Force UI update
+        icon_p = HESSU_SYMBOLS_DIR / prefix / f"{hessu_num:02d}.png"
+
+        if icon_p.exists():
+            pix = QPixmap(str(icon_p)).scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            if overlay:
+                # Render overlay char on preview
+                overlaid = make_overlay(icon_p, overlay)
+                pix = QPixmap(str(overlaid)).scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.symbol_preview.setPixmap(pix)
+
+        overlay_str = f" [{overlay}]" if overlay else ""
+        self.preset_log.append(f"🎨 Symbol: {table}{code}{overlay_str} - {name}")
+
         self.symbol_table_combo.repaint()
         self.symbol_code_edit.repaint()
+
+    def _on_overlay_changed(self, text):
+        """Update symbol preview when overlay char changes"""
+        overlay = text.strip().upper()
+        code = self.symbol_code_edit.text()
+        if not code:
+            return
+        # Determine current table
+        table_idx = self.symbol_table_picker.currentIndex()
+        prefix = "secondary" if table_idx == 1 or overlay else "primary"
+        hessu_num = ord(code) - 33
+        icon_p = HESSU_SYMBOLS_DIR / prefix / f"{hessu_num:02d}.png"
+        if icon_p.exists():
+            if overlay and (overlay.isalpha() or overlay.isdigit()):
+                overlaid = make_overlay(icon_p, overlay)
+                pix = QPixmap(str(overlaid)).scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            else:
+                pix = QPixmap(str(icon_p)).scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.symbol_preview.setPixmap(pix)
     
     def load_com_ports(self):
         """Load available COM ports into PTT combo boxes"""
@@ -5079,8 +5096,8 @@ class MainWindow(QMainWindow):
     def _sync_beacon_connection_status(self):
         """Sync all connection status from Settings to Beacon tab"""
         # PTT Status
-        if self.ptt_serial and self.ptt_serial.is_open:
-            self.tx_ptt_status.setText(f"🟢 PTT: {self.ptt_serial.port}")
+        if self._ptt_is_connected():
+            self.tx_ptt_status.setText(f"🟢 PTT: {self._ptt_port_label()}")
             self.tx_ptt_status.setStyleSheet("color: #69f0ae;")
         else:
             self.tx_ptt_status.setText("⚫ PTT: Not connected")
@@ -5149,8 +5166,8 @@ class MainWindow(QMainWindow):
     def _sync_vara_fm_connection_status(self):
         """Sync all connection statuses on VARA FM tab"""
         # PTT Status
-        if self.ptt_serial and self.ptt_serial.is_open:
-            self.vara_ptt_status.setText(f"🟢 PTT: {self.ptt_serial.port}")
+        if self._ptt_is_connected():
+            self.vara_ptt_status.setText(f"🟢 PTT: {self._ptt_port_label()}")
             self.vara_ptt_status.setStyleSheet("color: #69f0ae;")
         else:
             self.vara_ptt_status.setText("⚫ PTT: Not connected")
@@ -5503,2261 +5520,6 @@ class MainWindow(QMainWindow):
     # Earthquake Monitor
     # =========================================================================
     
-    def _toggle_earthquake_monitor(self, state):
-        """Enable/disable earthquake monitoring"""
-        enabled = state == Qt.CheckState.Checked.value
-        self.quake_refresh_btn.setEnabled(enabled)
-        
-        # Sync RX tab checkbox
-        if hasattr(self, 'rx_quake_check'):
-            self.rx_quake_check.blockSignals(True)
-            self.rx_quake_check.setChecked(enabled)
-            self.rx_quake_check.blockSignals(False)
-        
-        if enabled:
-            self.quake_status.setText("🟢 Enabled")
-            self.quake_status.setStyleSheet("color: #69f0ae;")
-            self._fetch_earthquakes()
-            # Set up auto-refresh timer (every 5 minutes)
-            if not hasattr(self, 'quake_timer'):
-                self.quake_timer = QTimer()
-                self.quake_timer.timeout.connect(self._fetch_earthquakes)
-            self.quake_timer.start(5 * 60 * 1000)  # 5 minutes
-        else:
-            self.quake_status.setText("⚫ Disabled")
-            self.quake_status.setStyleSheet("color: #888;")
-            if hasattr(self, 'quake_timer'):
-                self.quake_timer.stop()
-            # Clear earthquakes from map
-            if self.map_ready:
-                self.map.page().runJavaScript("clearEarthquakes()")
-    
-    def _fetch_earthquakes(self):
-        """Fetch earthquake data from USGS"""
-        import urllib.request
-        import json as json_module
-        
-        # Get settings
-        radius_miles = self.quake_radius.value()
-        min_mag = self.quake_min_mag.value()
-        time_range = self.quake_time_range.currentData() if hasattr(self, 'quake_time_range') else "day"
-        
-        # Map time range to USGS starttime parameter
-        time_params = {
-            "hour": "&starttime=" + (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
-            "day": "&starttime=" + (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
-            "week": "&starttime=" + (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"),
-            "month": "&starttime=" + (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
-        }
-        time_param = time_params.get(time_range, time_params["day"])
-        
-        # Get center point (use manual location or GPS)
-        if hasattr(self, 'gps_has_fix') and self.gps_has_fix:
-            center_lat = self.gps_lat
-            center_lon = self.gps_lon
-        else:
-            manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
-            if manual_text:
-                try:
-                    parts = manual_text.replace(" ", "").split(",")
-                    center_lat = float(parts[0])
-                    center_lon = float(parts[1])
-                except (ValueError, IndexError):
-                    center_lat, center_lon = 34.05, -118.25  # Default LA
-            else:
-                center_lat, center_lon = 34.05, -118.25
-        
-        # Convert radius to km for USGS API
-        radius_km = radius_miles * 1.60934
-        
-        # USGS API with time range
-        url = f"https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&latitude={center_lat}&longitude={center_lon}&maxradiuskm={radius_km}&minmagnitude={min_mag}&orderby=time&limit=100{time_param}"
-        
-        time_labels = {"hour": "1hr", "day": "24hr", "week": "7d", "month": "30d"}
-        self._log(f"🌋 Fetching {time_labels.get(time_range, '24hr')} earthquakes within {radius_miles}mi...")
-        self._log(f"   URL: {url[:80]}...")
-        self.quake_status.setText("🔄")
-        self.quake_status.setStyleSheet("color: #ffd54f;")
-        
-        # Non-blocking fetch using QThreadPool
-        worker = NetworkFetchWorker(url, timeout=30)
-        worker.signals.finished.connect(self._process_earthquake_data)
-        worker.signals.error.connect(lambda e: self._process_earthquake_data({"error": e}))
-        QThreadPool.globalInstance().start(worker)
-    
-    def _process_earthquake_data(self, data):
-        """Process earthquake data and update map"""
-        if "error" in data:
-            self._log(f"❌ Earthquake fetch failed: {data['error']}")
-            self.quake_status.setText("🔴 Error")
-            self.quake_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        features = data.get("features", [])
-        count = len(features)
-        
-        if count == 0:
-            self._log("🌋 No earthquakes found in range")
-            self.quake_status.setText("🟢 0 quakes")
-            self.quake_status.setStyleSheet("color: #69f0ae;")
-            if self.map_ready:
-                self.map.page().runJavaScript("clearEarthquakes()")
-            return
-        
-        self._log(f"🌋 Found {count} earthquakes")
-        self.quake_status.setText(f"🟢 {count} quakes")
-        self.quake_status.setStyleSheet("color: #69f0ae;")
-        
-        # Track recent quakes for alerts
-        recent_count = 0
-        now_ms = datetime.now().timestamp() * 1000
-        
-        # Build list for bulk loading (faster than Python→JS per marker)
-        quake_list = []
-        import json
-        
-        for feature in features:
-            props = feature.get("properties", {})
-            geom = feature.get("geometry", {})
-            coords = geom.get("coordinates", [0, 0, 0])
-            
-            lon, lat, depth = coords[0], coords[1], coords[2] if len(coords) > 2 else 0
-            mag = props.get("mag", 0) or 0
-            place = props.get("place", "Unknown")
-            time_ms = props.get("time", 0)
-            
-            # Check if recent (within 24 hours)
-            age_hours = (now_ms - time_ms) / (1000 * 60 * 60)
-            is_recent = age_hours < 24
-            if is_recent:
-                recent_count += 1
-            
-            # Format time
-            try:
-                quake_time = datetime.fromtimestamp(time_ms / 1000).strftime("%m/%d %H:%M")
-                if age_hours < 1:
-                    quake_time += " (NEW!)"
-                elif age_hours < 24:
-                    quake_time += f" ({age_hours:.0f}h ago)"
-            except (ValueError, OSError, OverflowError):
-                quake_time = "Unknown"
-            
-            # Color based on magnitude AND recency
-            if is_recent:
-                # Recent quakes - brighter colors
-                if mag >= 5.0:
-                    color = "#ff0000"  # Bright red
-                elif mag >= 4.0:
-                    color = "#ff6600"  # Bright orange
-                elif mag >= 3.0:
-                    color = "#ffcc00"  # Bright yellow
-                else:
-                    color = "#00ff00"  # Bright green
-            else:
-                # Older quakes - muted colors
-                if mag >= 5.0:
-                    color = "#aa4444"  # Muted red
-                elif mag >= 4.0:
-                    color = "#aa6644"  # Muted orange
-                elif mag >= 3.0:
-                    color = "#aaaa44"  # Muted yellow
-                else:
-                    color = "#44aa44"  # Muted green
-            
-            # Size based on magnitude
-            size = max(8, min(30, int(mag * 5)))
-            
-            tooltip = f"M{mag:.1f} - {place}<br>Depth: {depth:.1f}km<br>{quake_time}"
-            
-            quake_list.append({
-                "lat": lat,
-                "lon": lon,
-                "mag": mag,
-                "color": color,
-                "size": size,
-                "tooltip": tooltip,
-                "isRecent": is_recent
-            })
-        
-        # Send all earthquakes in one JS call
-        if self.map_ready and quake_list:
-            js = f"setEarthquakesBulk({json.dumps(quake_list)})"
-            self.map.page().runJavaScript(js)
-        
-        # Alert if there are recent quakes
-        if recent_count > 0:
-            self.quake_status.setText(f"🔴 {recent_count} new!")
-            self.quake_status.setStyleSheet("color: #ff6600; font-weight: bold;")
-            self._log(f"⚠️ {recent_count} earthquakes in last 24 hours!")
-        else:
-            self.quake_status.setText(f"🟢 {count}")
-            self.quake_status.setStyleSheet("color: #69f0ae;")
-
-    # =========================================================================
-    # Air Quality (AQI) Monitor - AirNow API
-    # =========================================================================
-    
-    def _toggle_aqi_monitor(self, state):
-        """Enable/disable AQI monitoring"""
-        enabled = state == Qt.CheckState.Checked.value
-        
-        if hasattr(self, 'aqi_refresh_btn'):
-            self.aqi_refresh_btn.setEnabled(enabled)
-        
-        # Sync RX tab checkbox
-        if hasattr(self, 'rx_aqi_check'):
-            self.rx_aqi_check.blockSignals(True)
-            self.rx_aqi_check.setChecked(enabled)
-            self.rx_aqi_check.blockSignals(False)
-        
-        if enabled:
-            if hasattr(self, 'aqi_status'):
-                self.aqi_status.setText("🟢 Enabled")
-                self.aqi_status.setStyleSheet("color: #69f0ae;")
-            self._fetch_aqi_data()
-            # Set up auto-refresh timer (every 30 minutes - AQI doesn't change fast)
-            if not hasattr(self, 'aqi_timer'):
-                self.aqi_timer = QTimer()
-                self.aqi_timer.timeout.connect(self._fetch_aqi_data)
-            self.aqi_timer.start(30 * 60 * 1000)  # 30 minutes
-        else:
-            if hasattr(self, 'aqi_status'):
-                self.aqi_status.setText("⚫ Disabled")
-                self.aqi_status.setStyleSheet("color: #888;")
-            if hasattr(self, 'aqi_timer'):
-                self.aqi_timer.stop()
-            # Clear AQI from map
-            if self.map_ready:
-                self.map.page().runJavaScript("clearAQI()")
-    
-    def _fetch_aqi_data(self):
-        """Fetch AQI data from AirNow API"""
-        # Get center point (use GPS first, then manual location)
-        if hasattr(self, 'gps_has_fix') and self.gps_has_fix and self.gps_lat is not None:
-            center_lat = self.gps_lat
-            center_lon = self.gps_lon
-            self._log(f"💨 Using GPS location: {center_lat:.4f}, {center_lon:.4f}")
-        else:
-            manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
-            if manual_text:
-                try:
-                    parts = manual_text.replace(" ", "").split(",")
-                    center_lat = float(parts[0])
-                    center_lon = float(parts[1])
-                    self._log(f"💨 Using manual location: {center_lat:.4f}, {center_lon:.4f}")
-                except (ValueError, IndexError):
-                    center_lat, center_lon = 34.05, -118.25  # Default LA
-                    self._log(f"💨 Using default location: {center_lat}, {center_lon}")
-            else:
-                center_lat, center_lon = 34.05, -118.25
-                self._log(f"💨 Using default location: {center_lat}, {center_lon}")
-        
-        # AirNow API - requires API key
-        api_key = self.aqi_api_key.text().strip() if hasattr(self, 'aqi_api_key') else ""
-        if not api_key:
-            self._log("💨 AQI: API key required!")
-            self._log("   Get free key from: https://docs.airnowapi.org/")
-            if hasattr(self, 'aqi_status'):
-                self.aqi_status.setText("⚠️ Need key")
-                self.aqi_status.setStyleSheet("color: #ffd54f;")
-            return
-        
-        url = f"https://www.airnowapi.org/aq/observation/latLong/current/?format=application/json&latitude={center_lat}&longitude={center_lon}&distance=25&API_KEY={api_key}"
-        
-        self._log(f"💨 Fetching AQI data...")
-        if hasattr(self, 'aqi_status'):
-            self.aqi_status.setText("🔄")
-            self.aqi_status.setStyleSheet("color: #ffd54f;")
-        
-        # Non-blocking fetch using QThreadPool
-        headers = {'User-Agent': 'PyTNC-Pro/1.0'}
-        worker = NetworkFetchWorker(url, headers=headers, timeout=15)
-        worker.signals.finished.connect(self._process_aqi_data)
-        worker.signals.error.connect(lambda e: self._process_aqi_data({"error": e}))
-        QThreadPool.globalInstance().start(worker)
-    
-    def _process_aqi_data(self, data):
-        """Process AQI data from AirNow"""
-        if "error" in data:
-            self._log(f"❌ AQI fetch failed: {data['error']}")
-            if hasattr(self, 'aqi_status'):
-                self.aqi_status.setText("🔴 Err")
-                self.aqi_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        # AirNow returns a list of observations
-        if not isinstance(data, list) or len(data) == 0:
-            self._log("💨 No AQI data available for this location")
-            if hasattr(self, 'aqi_status'):
-                self.aqi_status.setText("🟡 No data")
-                self.aqi_status.setStyleSheet("color: #ffd54f;")
-            return
-        
-        # Find PM2.5 or O3 reading (most relevant for smoke)
-        pm25_data = None
-        o3_data = None
-        for obs in data:
-            param = obs.get("ParameterName", "")
-            if "PM2.5" in param:
-                pm25_data = obs
-            elif "O3" in param or "OZONE" in param.upper():
-                o3_data = obs
-        
-        # Prefer PM2.5 (better for smoke), fall back to O3
-        aqi_obs = pm25_data or o3_data or (data[0] if data else None)
-        
-        if not aqi_obs:
-            self._log("💨 No valid AQI readings found")
-            return
-        
-        aqi_value = aqi_obs.get("AQI", 0)
-        param = aqi_obs.get("ParameterName", "AQI")
-        category = aqi_obs.get("Category", {}).get("Name", "Unknown")
-        reporting_area = aqi_obs.get("ReportingArea", "")
-        lat = aqi_obs.get("Latitude", 0)
-        lon = aqi_obs.get("Longitude", 0)
-        
-        # AQI color coding per EPA standards
-        if aqi_value <= 50:
-            color = "#00e400"  # Good - Green
-            emoji = "🟢"
-        elif aqi_value <= 100:
-            color = "#ffff00"  # Moderate - Yellow
-            emoji = "🟡"
-        elif aqi_value <= 150:
-            color = "#ff7e00"  # Unhealthy for Sensitive Groups - Orange
-            emoji = "🟠"
-        elif aqi_value <= 200:
-            color = "#ff0000"  # Unhealthy - Red
-            emoji = "🔴"
-        elif aqi_value <= 300:
-            color = "#8f3f97"  # Very Unhealthy - Purple
-            emoji = "🟣"
-        else:
-            color = "#7e0023"  # Hazardous - Maroon
-            emoji = "⛔"
-        
-        self._log(f"💨 AQI: {aqi_value} ({category}) - {param}")
-        self._log(f"   {reporting_area}")
-        
-        if hasattr(self, 'aqi_status'):
-            self.aqi_status.setText(f"{emoji} {aqi_value}")
-            self.aqi_status.setStyleSheet(f"color: {color}; font-weight: bold;")
-        
-        # Add AQI marker to map
-        if self.map_ready and lat and lon:
-            tooltip = f"<b>💨 AQI: {aqi_value}</b><br>{category}<br>{param}<br>{reporting_area}"
-            import json
-            js = f"addAQIMarker({lat},{lon},{aqi_value},'{color}',{json.dumps(tooltip)})"
-            self.map.page().runJavaScript(js)
-
-    # =========================================================================
-    # Fire/Wildfire Monitor (NASA FIRMS)
-    # =========================================================================
-    
-    def _toggle_fire_monitor(self, state):
-        """Toggle fire monitoring on/off"""
-        enabled = state == Qt.CheckState.Checked.value
-        self.fire_refresh_btn.setEnabled(enabled)
-        
-        # Sync RX tab checkbox
-        if hasattr(self, 'rx_fire_check'):
-            self.rx_fire_check.blockSignals(True)
-            self.rx_fire_check.setChecked(enabled)
-            self.rx_fire_check.blockSignals(False)
-        
-        if enabled:
-            api_key = self.fire_api_key.text().strip()
-            if not api_key:
-                self._log("🔥 Fire monitor: API key required!")
-                self._log("   Get free key from: https://firms.modaps.eosdis.nasa.gov/api/area/")
-                self.fire_status.setText("⚠️ Need key")
-                self.fire_status.setStyleSheet("color: #ffd54f;")
-                return
-            
-            self._fetch_fires()
-            # Auto-refresh every 30 minutes
-            if not hasattr(self, 'fire_timer'):
-                self.fire_timer = QTimer()
-                self.fire_timer.timeout.connect(self._fetch_fires)
-            self.fire_timer.start(30 * 60 * 1000)  # 30 minutes
-        else:
-            if hasattr(self, 'fire_timer'):
-                self.fire_timer.stop()
-            # Clear fire markers
-            if self.map_ready:
-                self.map.page().runJavaScript("clearFires()")
-            self.fire_status.setText("⚫")
-            self.fire_status.setStyleSheet("color: #888;")
-    
-    def _fetch_fires(self):
-        """Fetch fire/hotspot data from NASA FIRMS API"""
-        import urllib.request
-        
-        api_key = self.fire_api_key.text().strip()
-        if not api_key:
-            self._log("🔥 Fire fetch: No API key")
-            return
-        
-        # Get settings
-        time_range = self.fire_time_range.currentData() if hasattr(self, 'fire_time_range') else "24h"
-        source = self.fire_source.currentData() if hasattr(self, 'fire_source') else "VIIRS_SNPP_NRT"
-        
-        # Get center point (use beacon location or default)
-        try:
-            lat = float(self.beacon_lat.text())
-            lon = float(self.beacon_lon.text())
-        except (ValueError, AttributeError):
-            lat, lon = 34.05, -118.25  # Default LA
-        
-        # NASA FIRMS API - area query (bounding box around center)
-        # Format: west,south,east,north
-        radius_deg = 2.0  # ~140 miles at LA latitude
-        west = lon - radius_deg
-        east = lon + radius_deg
-        south = lat - radius_deg
-        north = lat + radius_deg
-        
-        # Map time range to FIRMS day_range parameter
-        day_map = {"24h": 1, "48h": 2, "7d": 7}
-        days = day_map.get(time_range, 1)
-        
-        # FIRMS CSV API URL
-        url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{api_key}/{source}/{west},{south},{east},{north}/{days}"
-        
-        self._log(f"🔥 Fetching {time_range} fire data ({source})...")
-        self.fire_status.setText("🔄")
-        self.fire_status.setStyleSheet("color: #ffd54f;")
-        
-        # Non-blocking fetch
-        worker = NetworkFetchWorker(url, timeout=30)
-        worker.signals.finished.connect(self._process_fire_data_csv)
-        worker.signals.error.connect(lambda e: self._process_fire_error(e))
-        QThreadPool.globalInstance().start(worker)
-    
-    def _process_fire_error(self, error):
-        """Handle fire fetch error"""
-        self._log(f"❌ Fire fetch failed: {error}")
-        self.fire_status.setText("🔴 Error")
-        self.fire_status.setStyleSheet("color: #ef5350;")
-        
-        if "403" in str(error) or "401" in str(error):
-            self._log("   Check your NASA FIRMS API key")
-    
-    def _process_fire_data_csv(self, data):
-        """Process fire CSV data from NASA FIRMS"""
-        # NetworkFetchWorker returns dict with raw text for non-JSON
-        if isinstance(data, dict):
-            if "error" in data:
-                self._process_fire_error(data["error"])
-                return
-            # If it parsed as JSON (error response), check for message
-            if "message" in data:
-                self._log(f"❌ FIRMS API error: {data.get('message', 'Unknown')}")
-                self.fire_status.setText("🔴 API Error")
-                self.fire_status.setStyleSheet("color: #ef5350;")
-                return
-        
-        # Clear existing fires
-        if self.map_ready:
-            self.map.page().runJavaScript("clearFires()")
-        
-        # Parse CSV response
-        try:
-            lines = data if isinstance(data, str) else str(data)
-            if not lines or "latitude" not in lines.lower():
-                self._log("🔥 No fire data or invalid response")
-                self.fire_status.setText("⚫ No data")
-                self.fire_status.setStyleSheet("color: #888;")
-                return
-            
-            rows = lines.strip().split('\n')
-            if len(rows) < 2:
-                self._log("🔥 No fires detected in area")
-                self.fire_status.setText("🟢 0 fires")
-                self.fire_status.setStyleSheet("color: #69f0ae;")
-                return
-            
-            # Parse header to find column indices
-            header = rows[0].lower().split(',')
-            try:
-                lat_idx = header.index('latitude')
-                lon_idx = header.index('longitude')
-                bright_idx = header.index('bright_ti4') if 'bright_ti4' in header else header.index('brightness')
-                conf_idx = header.index('confidence') if 'confidence' in header else -1
-                sat_idx = header.index('satellite') if 'satellite' in header else -1
-                time_idx = header.index('acq_time') if 'acq_time' in header else -1
-                date_idx = header.index('acq_date') if 'acq_date' in header else -1
-            except ValueError as e:
-                self._log(f"🔥 CSV parse error: {e}")
-                self.fire_status.setText("🔴 Parse err")
-                return
-            
-            # Build list for bulk loading (faster than Python→JS per marker)
-            fire_list = []
-            import json
-            
-            for row in rows[1:]:
-                cols = row.split(',')
-                if len(cols) <= max(lat_idx, lon_idx, bright_idx):
-                    continue
-                
-                try:
-                    lat = float(cols[lat_idx])
-                    lon = float(cols[lon_idx])
-                    brightness = float(cols[bright_idx])
-                    confidence = cols[conf_idx] if conf_idx >= 0 and conf_idx < len(cols) else "N/A"
-                    satellite = cols[sat_idx] if sat_idx >= 0 and sat_idx < len(cols) else "Unknown"
-                    acq_time = cols[time_idx] if time_idx >= 0 and time_idx < len(cols) else ""
-                    acq_date = cols[date_idx] if date_idx >= 0 and date_idx < len(cols) else ""
-                    
-                    # Build tooltip
-                    tooltip = f"Brightness: {brightness:.0f}K<br>"
-                    tooltip += f"Confidence: {confidence}<br>"
-                    tooltip += f"Satellite: {satellite}<br>"
-                    if acq_date and acq_time:
-                        tooltip += f"Detected: {acq_date} {acq_time}"
-                    
-                    fire_list.append({
-                        "lat": lat,
-                        "lon": lon,
-                        "brightness": brightness,
-                        "tooltip": tooltip
-                    })
-                except (ValueError, IndexError):
-                    continue
-            
-            fire_count = len(fire_list)
-            
-            # Send all fires in one JS call
-            if self.map_ready and fire_list:
-                js = f"setFiresBulk({json.dumps(fire_list)})"
-                self.map.page().runJavaScript(js)
-            
-            self._log(f"🔥 Found {fire_count} fire hotspots")
-            
-            if fire_count > 0:
-                self.fire_status.setText(f"🔴 {fire_count} fires!")
-                self.fire_status.setStyleSheet("color: #ff6600; font-weight: bold;")
-            else:
-                self.fire_status.setText("🟢 0 fires")
-                self.fire_status.setStyleSheet("color: #69f0ae;")
-                
-        except Exception as e:
-            self._log(f"🔥 Fire data processing error: {e}")
-            self.fire_status.setText("🔴 Error")
-            self.fire_status.setStyleSheet("color: #ef5350;")
-
-    # =========================================================================
-    # Hospital Layer (with offline caching)
-    # =========================================================================
-    
-    def _get_hospital_cache_file(self):
-        """Get path to hospital cache file"""
-        cache_dir = CACHE_DIR
-        cache_dir.mkdir(exist_ok=True)
-        return cache_dir / "hospitals.json"
-    
-    def _load_hospital_cache(self):
-        """Load hospitals from local cache"""
-        cache_file = self._get_hospital_cache_file()
-        if cache_file.exists():
-            try:
-                import json as json_module
-                with open(cache_file, 'r') as f:
-                    data = json_module.load(f)
-                    # Update offline indicator
-                    cached_time = data.get("cached_at", "Unknown")
-                    count = len(data.get("hospitals", []))
-                    self.hospital_offline_indicator.setText(f"💾 {count}")
-                    self.hospital_offline_indicator.setToolTip(f"Cached: {cached_time}")
-                    return data
-            except Exception as e:
-                self._log(f"⚠️ Hospital cache load failed: {e}")
-        return None
-    
-    def _save_hospital_cache(self, hospitals):
-        """Save hospitals to local cache for offline use"""
-        cache_file = self._get_hospital_cache_file()
-        try:
-            import json as json_module
-            data = {
-                "cached_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "hospitals": hospitals
-            }
-            with open(cache_file, 'w') as f:
-                json_module.dump(data, f)
-            self._log(f"💾 Saved {len(hospitals)} hospitals to cache")
-            self.hospital_offline_indicator.setText(f"💾 {len(hospitals)}")
-            self.hospital_offline_indicator.setToolTip(f"Cached: {data['cached_at']}")
-        except Exception as e:
-            self._log(f"⚠️ Hospital cache save failed: {e}")
-    
-    def _rx_toggle_callsigns(self, state):
-        """Toggle callsign labels visibility on map"""
-        enabled = state == Qt.CheckState.Checked.value
-        if self.map_ready:
-            js = f"toggleCallsignLabels({str(enabled).lower()})"
-            self.map.page().runJavaScript(js)
-    
-    def _rx_toggle_trails(self, state):
-        """Toggle station trails visibility on map"""
-        enabled = state == Qt.CheckState.Checked.value
-        if self.map_ready:
-            js = f"toggleTrails({str(enabled).lower()})"
-            self.map.page().runJavaScript(js)
-    
-    def _rx_toggle_hospitals(self, state):
-        """Toggle hospitals from RX page checkbox - syncs with Settings"""
-        # Sync to settings checkbox
-        if hasattr(self, 'hospital_enabled'):
-            self.hospital_enabled.blockSignals(True)
-            self.hospital_enabled.setChecked(state == Qt.CheckState.Checked.value)
-            self.hospital_enabled.blockSignals(False)
-        # Actually toggle the layer
-        self._toggle_hospital_layer(state)
-    
-    def _toggle_hospital_layer(self, state):
-        """Enable/disable hospital layer"""
-        enabled = state == Qt.CheckState.Checked.value
-        
-        # Sync RX page checkbox
-        if hasattr(self, 'rx_hospital_check'):
-            self.rx_hospital_check.blockSignals(True)
-            self.rx_hospital_check.setChecked(enabled)
-            self.rx_hospital_check.blockSignals(False)
-        
-        if enabled:
-            self.hospital_status.setText("🔄")
-            self.hospital_status.setStyleSheet("color: #ffd54f;")
-            # Try to load from cache first (offline mode)
-            cache = self._load_hospital_cache()
-            if cache and cache.get("hospitals"):
-                self._log("🏥 Loading hospitals from offline cache...")
-                self._display_hospitals(cache["hospitals"])
-            else:
-                self._log("🏥 No cached data - fetching from internet...")
-                self._fetch_hospitals()
-        else:
-            self.hospital_status.setText("⚫")
-            self.hospital_status.setStyleSheet("color: #888;")
-            # Clear hospitals from map
-            if self.map_ready:
-                self.map.page().runJavaScript("clearHospitals()")
-    
-    def _fetch_hospitals(self):
-        """Fetch hospital data from OpenStreetMap Overpass API"""
-        import json as json_module
-        
-        radius_miles = self.hospital_radius.value()
-        radius_meters = int(radius_miles * 1609.34)
-        
-        # Get center point
-        if hasattr(self, 'gps_has_fix') and self.gps_has_fix:
-            center_lat = self.gps_lat
-            center_lon = self.gps_lon
-        else:
-            manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
-            if manual_text:
-                try:
-                    parts = manual_text.replace(" ", "").split(",")
-                    center_lat = float(parts[0])
-                    center_lon = float(parts[1])
-                except (ValueError, IndexError):
-                    center_lat, center_lon = 34.05, -118.25
-            else:
-                center_lat, center_lon = 34.05, -118.25
-        
-        # Overpass API query
-        query = f'[out:json];(node["amenity"="hospital"](around:{radius_meters},{center_lat},{center_lon});way["amenity"="hospital"](around:{radius_meters},{center_lat},{center_lon}););out center 100;'
-        
-        # Try multiple Overpass servers (some may be down or slow)
-        overpass_servers = [
-            "https://overpass-api.de/api/interpreter",
-            "https://overpass.kumi.systems/api/interpreter",
-        ]
-        url = f"{overpass_servers[0]}?data={urllib.parse.quote(query)}"
-        
-        # Store fallback URL for retry
-        self._hospital_fallback_url = f"{overpass_servers[1]}?data={urllib.parse.quote(query)}"
-        self._hospital_fallback_tried = False
-        
-        self._log(f"🏥 Downloading hospitals within {radius_miles}mi...")
-        self.hospital_status.setText("⬇️")
-        self.hospital_status.setStyleSheet("color: #ffd54f;")
-        
-        # Non-blocking fetch using QThreadPool
-        worker = NetworkFetchWorker(url, timeout=15)
-        worker.signals.finished.connect(self._process_hospital_data)
-        worker.signals.error.connect(lambda e: self._process_hospital_data({"error": e}))
-        QThreadPool.globalInstance().start(worker)
-    
-    def _process_hospital_data(self, data):
-        """Process hospital data and update map"""
-        if "error" in data:
-            # Try fallback server if not already tried
-            if hasattr(self, '_hospital_fallback_url') and not getattr(self, '_hospital_fallback_tried', True):
-                self._hospital_fallback_tried = True
-                self._log(f"⚠️ Primary server failed, trying fallback...")
-                worker = NetworkFetchWorker(self._hospital_fallback_url, timeout=30)
-                worker.signals.finished.connect(self._process_hospital_data)
-                worker.signals.error.connect(lambda e: self._process_hospital_data({"error": e}))
-                QThreadPool.globalInstance().start(worker)
-                return
-            
-            self._log(f"❌ Hospital fetch failed: {data['error']}")
-            self.hospital_status.setText("🔴 Err")
-            self.hospital_status.setStyleSheet("color: #ef5350;")
-            # Try to use cached data
-            cache = self._load_hospital_cache()
-            if cache and cache.get("hospitals"):
-                self._log("📴 Using offline cache instead...")
-                self._display_hospitals(cache["hospitals"])
-            return
-        
-        elements = data.get("elements", [])
-        
-        if len(elements) == 0:
-            self._log("🏥 No hospitals found in range")
-            self.hospital_status.setText("0")
-            self.hospital_status.setStyleSheet("color: #69f0ae;")
-            return
-        
-        # Parse and store hospitals
-        hospitals = []
-        for element in elements:
-            # Get coordinates (node has lat/lon directly, way has center)
-            if element.get("type") == "node":
-                lat = element.get("lat", 0)
-                lon = element.get("lon", 0)
-            else:
-                center = element.get("center", {})
-                lat = center.get("lat", 0)
-                lon = center.get("lon", 0)
-            
-            if lat == 0 or lon == 0:
-                continue
-            
-            tags = element.get("tags", {})
-            hospital = {
-                "lat": lat,
-                "lon": lon,
-                "name": tags.get("name", "Hospital"),
-                "address": tags.get("addr:street", ""),
-                "housenumber": tags.get("addr:housenumber", ""),
-                "phone": tags.get("phone", ""),
-                "emergency": tags.get("emergency", "")
-            }
-            hospitals.append(hospital)
-        
-        # Save to cache for offline use
-        self._save_hospital_cache(hospitals)
-        
-        # Display on map
-        self._display_hospitals(hospitals)
-    
-    def _display_hospitals(self, hospitals):
-        """Display hospitals on the map"""
-        # Guard: only display if hospital layer is enabled
-        if hasattr(self, 'rx_hospital_check') and not self.rx_hospital_check.isChecked():
-            self._log("🏥 Skipping hospital display - layer disabled")
-            return
-        
-        count = len(hospitals)
-        self._log(f"🏥 Displaying {count} hospitals")
-        self.hospital_status.setText(f"🟢 {count}")
-        self.hospital_status.setStyleSheet("color: #69f0ae;")
-        
-        # Build list for bulk loading (faster than Python→JS per marker)
-        hospital_list = []
-        import json
-        
-        for h in hospitals:
-            name = h.get("name", "Hospital")
-            
-            # Build tooltip
-            tooltip_parts = [f"<b>{name}</b>"]
-            addr = h.get("address", "")
-            if addr:
-                housenumber = h.get("housenumber", "")
-                if housenumber:
-                    addr = housenumber + " " + addr
-                tooltip_parts.append(addr)
-            if h.get("phone"):
-                tooltip_parts.append(f"📞 {h['phone']}")
-            if h.get("emergency"):
-                tooltip_parts.append(f"🚑 Emergency: {h['emergency']}")
-            
-            tooltip = "<br>".join(tooltip_parts)
-            
-            hospital_list.append({
-                "lat": h['lat'],
-                "lon": h['lon'],
-                "name": name,
-                "tooltip": tooltip
-            })
-        
-        # Send all hospitals in one JS call
-        if self.map_ready and hospital_list:
-            js = f"setHospitalsBulk({json.dumps(hospital_list)})"
-            self.map.page().runJavaScript(js)
-
-    # =========================================================================
-    # Weather Alerts Layer (NWS API)
-    # =========================================================================
-    
-    def _rx_toggle_weather(self, state):
-        """Toggle weather alerts from RX page checkbox"""
-        if hasattr(self, 'weather_enabled'):
-            self.weather_enabled.blockSignals(True)
-            self.weather_enabled.setChecked(state == Qt.CheckState.Checked.value)
-            self.weather_enabled.blockSignals(False)
-        self._toggle_weather_layer(state)
-    
-    def _toggle_weather_layer(self, state):
-        """Enable/disable weather alerts layer"""
-        enabled = state == Qt.CheckState.Checked.value
-        
-        # Sync RX page checkbox
-        if hasattr(self, 'rx_weather_check'):
-            self.rx_weather_check.blockSignals(True)
-            self.rx_weather_check.setChecked(enabled)
-            self.rx_weather_check.blockSignals(False)
-        
-        if hasattr(self, 'weather_refresh_btn'):
-            self.weather_refresh_btn.setEnabled(enabled)
-        
-        if enabled:
-            self.weather_status.setText("🔄")
-            self.weather_status.setStyleSheet("color: #ffd54f;")
-            self._fetch_weather_alerts()
-            # Start 5-minute auto-refresh timer
-            if not hasattr(self, 'weather_timer'):
-                self.weather_timer = QTimer()
-                self.weather_timer.timeout.connect(self._fetch_weather_alerts)
-            self.weather_timer.start(5 * 60 * 1000)  # 5 minutes
-            self._log("⚠️ Weather alerts auto-refresh: every 5 min")
-        else:
-            self.weather_status.setText("⚫")
-            self.weather_status.setStyleSheet("color: #888;")
-            # Stop timer
-            if hasattr(self, 'weather_timer'):
-                self.weather_timer.stop()
-            if self.map_ready:
-                self.map.page().runJavaScript("clearWeatherAlerts()")
-    
-    def _fetch_weather_alerts(self):
-        """Fetch weather alerts from NWS API"""
-        import json as json_module
-        
-        # Get center point
-        if hasattr(self, 'gps_has_fix') and self.gps_has_fix:
-            center_lat, center_lon = self.gps_lat, self.gps_lon
-        else:
-            manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
-            if manual_text:
-                try:
-                    parts = manual_text.replace(" ", "").split(",")
-                    center_lat, center_lon = float(parts[0]), float(parts[1])
-                except (ValueError, IndexError):
-                    center_lat, center_lon = 34.05, -118.25
-            else:
-                center_lat, center_lon = 34.05, -118.25
-        
-        # NWS API - alerts for point
-        url = f"https://api.weather.gov/alerts/active?point={center_lat},{center_lon}"
-        
-        self._log(f"⚠️ Fetching weather alerts...")
-        self.weather_status.setText("🔄")
-        self.weather_status.setStyleSheet("color: #ffd54f;")
-        
-        # Non-blocking fetch using QThreadPool
-        headers = {'User-Agent': 'PyTNC-Pro/1.0', 'Accept': 'application/geo+json'}
-        worker = NetworkFetchWorker(url, headers=headers, timeout=15)
-        worker.signals.finished.connect(self._process_weather_data)
-        worker.signals.error.connect(lambda e: self._process_weather_data({"error": e}))
-        QThreadPool.globalInstance().start(worker)
-    
-    def _process_weather_data(self, data):
-        """Process weather alert data"""
-        if "error" in data:
-            self._log(f"❌ Weather alert fetch failed: {data['error']}")
-            self.weather_status.setText("🔴 Err")
-            self.weather_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        features = data.get("features", [])
-        count = len(features)
-        
-        if count == 0:
-            self._log("⚠️ No active weather alerts")
-            self.weather_status.setText("🟢 0")
-            self.weather_status.setStyleSheet("color: #69f0ae;")
-            return
-        
-        self._log(f"⚠️ Found {count} weather alerts!")
-        
-        # Color by severity
-        has_severe = False
-        for f in features:
-            props = f.get("properties", {})
-            severity = props.get("severity", "").lower()
-            if severity in ["extreme", "severe"]:
-                has_severe = True
-                break
-        
-        if has_severe:
-            self.weather_status.setText(f"🔴 {count}!")
-            self.weather_status.setStyleSheet("color: #ff0000; font-weight: bold;")
-        else:
-            self.weather_status.setText(f"🟡 {count}")
-            self.weather_status.setStyleSheet("color: #ff9800;")
-        
-        # Clear existing alerts
-        if self.map_ready:
-            self.map.page().runJavaScript("clearWeatherAlerts()")
-        
-        # Add each alert
-        for feature in features:
-            props = feature.get("properties", {})
-            
-            event = props.get("event", "Weather Alert")
-            headline = props.get("headline", "")[:100]
-            severity = props.get("severity", "Unknown")
-            urgency = props.get("urgency", "Unknown")
-            areas = props.get("areaDesc", "")[:50]
-            
-            # Color by severity
-            if severity.lower() == "extreme":
-                color = "#ff0000"
-            elif severity.lower() == "severe":
-                color = "#ff6600"
-            elif severity.lower() == "moderate":
-                color = "#ffcc00"
-            else:
-                color = "#66ccff"
-            
-            # Log the alert details - ALWAYS BOLD for alerts
-            self._log(f"   <span style='color:{color};font-weight:bold'>⚠️ {event}: {headline}</span>")
-            
-            # Get coordinates - try polygon first, fall back to user location
-            center_lat, center_lon = None, None
-            
-            geom = feature.get("geometry")
-            if geom and geom.get("type") == "Polygon":
-                coords = geom.get("coordinates", [[]])[0]
-                if coords:
-                    # Get centroid of polygon
-                    lats = [c[1] for c in coords]
-                    lons = [c[0] for c in coords]
-                    center_lat = sum(lats) / len(lats)
-                    center_lon = sum(lons) / len(lons)
-            
-            # Fall back to user's location if no polygon
-            if center_lat is None:
-                if hasattr(self, 'gps_has_fix') and self.gps_has_fix:
-                    center_lat, center_lon = self.gps_lat, self.gps_lon
-                else:
-                    manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
-                    if manual_text:
-                        try:
-                            parts = manual_text.replace(" ", "").split(",")
-                            center_lat, center_lon = float(parts[0]), float(parts[1])
-                        except (ValueError, IndexError):
-                            pass  # center_lat stays None, alert won't be plotted
-            
-            # Add to map if we have coordinates
-            if center_lat is not None and center_lon is not None:
-                tooltip = f"<b>⚠️ {event}</b><br>{headline}<br>Severity: {severity}<br>Area: {areas}"
-                
-                # Use JSON encoding to properly escape all special characters
-                import json
-                event_js = json.dumps(event)
-                tooltip_js = json.dumps(tooltip)
-                
-                js = f"addWeatherAlert({center_lat},{center_lon},{event_js},'{color}',{tooltip_js})"
-                if self.map_ready:
-                    self.map.page().runJavaScript(js)
-    # Offline Cache Functions
-    # =========================================================================
-    
-    def _ensure_cache_dir(self):
-        """Ensure cache directory exists"""
-        CACHE_DIR.mkdir(exist_ok=True)
-        return CACHE_DIR
-    
-    def _update_cache_status(self):
-        """Update cache status indicators"""
-        cache_dir = self._ensure_cache_dir()
-        
-        # Check for tiles in OLD location (app folder) - auto-migrate
-        old_tile_dir = BASE_DIR / "tile_cache"
-        if old_tile_dir.exists():
-            old_count = sum(1 for _ in old_tile_dir.rglob("*.png"))
-            new_count = sum(1 for _ in TILE_CACHE_DIR.rglob("*.png")) if TILE_CACHE_DIR.exists() else 0
-            
-            if old_count > 0 and new_count == 0:
-                self._log(f"🔄 Migrating {old_count:,} cached tiles...")
-                try:
-                    import shutil
-                    if TILE_CACHE_DIR.exists():
-                        shutil.rmtree(TILE_CACHE_DIR)
-                    shutil.copytree(old_tile_dir, TILE_CACHE_DIR)
-                    self._log(f"✅ Tile migration complete!")
-                except Exception as e:
-                    self._log(f"⚠️ Migration failed: {e}")
-        
-        # Map tiles - check TILE_CACHE_DIR
-        if TILE_CACHE_DIR.exists():
-            tile_count = sum(1 for _ in TILE_CACHE_DIR.rglob("*.png"))
-            if tile_count > 0:
-                zoom_dirs = sorted([int(d.name) for d in TILE_CACHE_DIR.iterdir() if d.is_dir() and d.name.isdigit()])
-                zoom_range = f"z{zoom_dirs[0]}-{zoom_dirs[-1]}" if zoom_dirs else "?"
-                self.cache_map_status.setText(f"💾 {tile_count:,}")
-                self.cache_map_status.setToolTip(f"{tile_count:,} tiles cached ({zoom_range})")
-                self._log(f"🗺️ Tile cache: {tile_count:,} tiles ({zoom_range})")
-                # Show per-zoom counts
-                for z in zoom_dirs:
-                    z_path = TILE_CACHE_DIR / str(z)
-                    z_count = sum(1 for _ in z_path.rglob("*.png"))
-                    self._log(f"   z{z}: {z_count:,} tiles")
-            else:
-                self.cache_map_status.setText("--")
-        else:
-            self.cache_map_status.setText("--")
-        
-        # Digipeaters
-        digi_file = cache_dir / "digipeaters.json"
-        if digi_file.exists():
-            try:
-                import json
-                with open(digi_file) as f:
-                    data = json.load(f)
-                    count = len(data.get("digipeaters", []))
-                    self.cache_digi_status.setText(f"💾 {count}")
-            except (json.JSONDecodeError, OSError, KeyError):
-                self.cache_digi_status.setText("💾 ?")
-        else:
-            self.cache_digi_status.setText("--")
-    
-    def _cache_map_tiles(self):
-        """Download and cache map tiles for the LA area"""
-        import math
-        import urllib.request
-        
-        # LA bounding box (covers greater LA area)
-        NORTH = 34.4
-        SOUTH = 33.6
-        WEST = -118.8
-        EAST = -117.5
-        
-        def lat_lon_to_tile(lat, lon, zoom):
-            n = 2 ** zoom
-            x = int((lon + 180) / 360 * n)
-            y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
-            return x, y
-        
-        # Get zoom range from slider
-        min_zoom = 8
-        max_zoom = self.cache_map_zoom_slider.value() if hasattr(self, 'cache_map_zoom_slider') else 14
-        
-        self._log(f"🗺️ Caching tiles z{min_zoom}-{max_zoom}...")
-        
-        # Calculate total tiles AND log per-zoom
-        total_tiles = 0
-        zoom_tile_counts = {}
-        for zoom in range(min_zoom, max_zoom + 1):
-            x1, y1 = lat_lon_to_tile(NORTH, WEST, zoom)
-            x2, y2 = lat_lon_to_tile(SOUTH, EAST, zoom)
-            x_min, x_max = min(x1, x2), max(x1, x2)
-            y_min, y_max = min(y1, y2), max(y1, y2)
-            count = (x_max - x_min + 1) * (y_max - y_min + 1)
-            zoom_tile_counts[zoom] = count
-            total_tiles += count
-            self._log(f"   z{zoom}: x={x_min}-{x_max} ({x_max-x_min+1}), y={y_min}-{y_max} ({y_max-y_min+1}) = {count:,} tiles")
-        
-        # Estimate size (~20KB per tile average)
-        est_size_mb = total_tiles * 20 / 1024
-        
-        # Confirm with user
-        reply = QMessageBox.question(self, "Cache LA Map Tiles",
-            f"Download {total_tiles:,} map tiles for LA area?\n\n"
-            f"Zoom levels: {min_zoom}-{max_zoom}\n"
-            f"Estimated size: ~{est_size_mb:.0f} MB\n\n"
-            f"Higher zoom = more detail = more tiles\n"
-            f"The app will wait until complete.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        
-        # Create progress dialog
-        progress = QProgressDialog("Caching map tiles...", "Cancel", 0, total_tiles, self)
-        progress.setWindowTitle("Downloading Map Tiles")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        
-        # Ensure cache directory
-        TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        
-        downloaded = 0
-        skipped = 0
-        errors = 0
-        
-        self._log(f"🗺️ Starting tile cache: {total_tiles} tiles, zoom {min_zoom}-{max_zoom}...")
-        
-        for zoom in range(min_zoom, max_zoom + 1):
-            x1, y1 = lat_lon_to_tile(NORTH, WEST, zoom)
-            x2, y2 = lat_lon_to_tile(SOUTH, EAST, zoom)
-            x_min, x_max = min(x1, x2), max(x1, x2)
-            y_min, y_max = min(y1, y2), max(y1, y2)
-            
-            zoom_dir = TILE_CACHE_DIR / str(zoom)
-            zoom_dir.mkdir(exist_ok=True)
-            
-            for x in range(x_min, x_max + 1):
-                x_dir = zoom_dir / str(x)
-                x_dir.mkdir(exist_ok=True)
-                
-                for y in range(y_min, y_max + 1):
-                    if progress.wasCanceled():
-                        self._log(f"🗺️ Tile caching cancelled. Downloaded: {downloaded}, Skipped: {skipped}")
-                        self._update_cache_status()
-                        return
-                    
-                    tile_file = x_dir / f"{y}.png"
-                    
-                    if tile_file.exists():
-                        skipped += 1
-                    else:
-                        try:
-                            url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
-                            req = urllib.request.Request(url, headers={'User-Agent': 'PyTNC-Pro/1.0'})
-                            with urllib.request.urlopen(req, timeout=10) as resp:
-                                with open(tile_file, 'wb') as f:
-                                    f.write(resp.read())
-                            downloaded += 1
-                            # Small delay to avoid rate limiting
-                            import time
-                            time.sleep(0.05)
-                        except Exception as e:
-                            errors += 1
-                    
-                    progress.setValue(downloaded + skipped + errors)
-                    progress.setLabelText(f"Zoom {zoom}: {downloaded} downloaded, {skipped} cached, {errors} errors")
-                    QApplication.processEvents()
-        
-        progress.close()
-        
-        self._log(f"🗺️ Tile cache complete: {downloaded} new, {skipped} existing, {errors} errors")
-        self._log(f"   Location: {TILE_CACHE_DIR}")
-        
-        # Verify tiles are accessible
-        test_tile = None
-        for png in TILE_CACHE_DIR.rglob("*.png"):
-            test_tile = png
-            break
-        if test_tile:
-            self._log(f"   ✓ Verified: {test_tile.relative_to(TILE_CACHE_DIR)}")
-        
-        self.cache_map_status.setText(f"✓ {downloaded + skipped}")
-        self._update_cache_status()
-        
-        QMessageBox.information(self, "Tile Cache Complete",
-            f"Map tiles cached!\n\n"
-            f"Downloaded: {downloaded}\n"
-            f"Already cached: {skipped}\n"
-            f"Errors: {errors}\n"
-            f"Total tiles: {downloaded + skipped}\n\n"
-            f"Location:\n{TILE_CACHE_DIR}")
-    
-    def _test_tile_cache(self):
-        """Test if tile cache is working"""
-        import urllib.request
-        
-        self._log("🔍 Testing tile cache...")
-        
-        # Check if cache exists
-        if not TILE_CACHE_DIR.exists():
-            QMessageBox.warning(self, "No Tile Cache", f"Tile cache directory doesn't exist:\n{TILE_CACHE_DIR}")
-            return
-        
-        # List zoom levels
-        zoom_dirs = sorted([d.name for d in TILE_CACHE_DIR.iterdir() if d.is_dir()])
-        
-        # Find a cached tile
-        test_tile = None
-        for png in TILE_CACHE_DIR.rglob("*.png"):
-            test_tile = png
-            break
-        
-        if not test_tile:
-            QMessageBox.warning(self, "Empty Cache", "No tiles found in cache. Click ⬇️ to download tiles.")
-            return
-        
-        # Get the relative path
-        rel_path = test_tile.relative_to(TILE_CACHE_DIR)
-        
-        # Try to fetch it via HTTP
-        tile_url = f"http://127.0.0.1:{self.http_port}/tile_cache/{rel_path.as_posix()}"
-        
-        try:
-            req = urllib.request.Request(tile_url)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = resp.read()
-                source = resp.headers.get('X-Tile-Source', 'unknown')
-                self._log(f"   ✅ Cache test OK ({len(data)} bytes)")
-                
-                QMessageBox.information(self, "Tile Cache Working!", 
-                    f"Tile cache is working!\n\n"
-                    f"Tiles: {sum(1 for _ in TILE_CACHE_DIR.rglob('*.png')):,}\n"
-                    f"Zoom levels: {', '.join(zoom_dirs)}\n\n"
-                    f"Your map should work offline.")
-        except Exception as e:
-            self._log(f"   ❌ Cache test failed: {e}")
-            QMessageBox.warning(self, "Tile Cache Error",
-                f"Could not fetch tile via HTTP!\n\n"
-                f"File exists: {test_tile.exists()}\n"
-                f"URL: {tile_url}\n"
-                f"Error: {e}\n\n"
-                f"Check console for more details.")
-    
-    def _cache_digipeaters(self):
-        """Download digipeaters from aprs.fi API"""
-        self._log("📡 Caching digipeaters...")
-        self.cache_digi_status.setText("⬇️")
-        QApplication.processEvents()
-        
-        # Get center point
-        if hasattr(self, 'gps_has_fix') and self.gps_has_fix:
-            center_lat, center_lon = self.gps_lat, self.gps_lon
-        else:
-            manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
-            if manual_text:
-                try:
-                    parts = manual_text.replace(" ", "").split(",")
-                    center_lat, center_lon = float(parts[0]), float(parts[1])
-                except (ValueError, IndexError):
-                    center_lat, center_lon = 34.05, -118.25
-            else:
-                center_lat, center_lon = 34.05, -118.25
-        
-        # Use Overpass to find APRS digipeaters (tagged in OSM)
-        radius_meters = 80000  # 50 miles
-        query = f'[out:json];node["radio:aprs"="yes"](around:{radius_meters},{center_lat},{center_lon});out 50;'
-        
-        # Try multiple Overpass servers
-        overpass_servers = [
-            "https://overpass-api.de/api/interpreter",
-            "https://overpass.kumi.systems/api/interpreter",
-        ]
-        
-        try:
-            import requests
-            import json
-            
-            data = None
-            for server in overpass_servers:
-                url = f"{server}?data={urllib.parse.quote(query)}"
-                try:
-                    resp = requests.get(url, timeout=15, headers={'User-Agent': 'PyTNC-Pro/1.0'})
-                    data = resp.json()
-                    break  # Success, stop trying
-                except Exception as e:
-                    self._log(f"⚠️ Overpass server failed: {server[:30]}... trying next")
-                    continue
-            
-            if not data:
-                raise Exception("All Overpass servers failed")
-            
-            digipeaters = []
-            for elem in data.get("elements", []):
-                tags = elem.get("tags", {})
-                digi = {
-                    "lat": elem.get("lat"),
-                    "lon": elem.get("lon"),
-                    "call": tags.get("callsign", tags.get("name", "Unknown")),
-                    "freq": tags.get("frequency", "144.390")
-                }
-                digipeaters.append(digi)
-            
-            # Save to cache
-            cache_file = self._ensure_cache_dir() / "digipeaters.json"
-            with open(cache_file, 'w') as f:
-                json.dump({
-                    "cached_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "digipeaters": digipeaters
-                }, f)
-            
-            self._log(f"📡 Cached {len(digipeaters)} digipeaters")
-        except Exception as e:
-            self._log(f"❌ Digi cache failed: {e}")
-        
-        self._update_cache_status()
-    
-
-    # =========================================================================
-    # DARN Emergency Repeater Network
-    # =========================================================================
-    
-    # Built-in DARN repeater database with coordinates
-    # Data from LAXNORTHEAST Radio Communications Plan
-    # Includes: 70cm (DARN 1-29), 2M (DARN 50-59), 6M (DARN 62-65), 1.25M (DARN 222-229)
-    DARN_REPEATERS = [
-        # 70cm Repeaters (DARN 1-29) - all -5 MHz offset
-        {"name": "LAX101", "darn": "DARN 1", "location": "Palos Verdes", "freq": "446.740", "offset": "-", "tone": "100", "lat": 33.74, "lon": -118.39, "status": "Online", "band": "70cm"},
-        {"name": "LAX102", "darn": "DARN 2", "location": "Mt. Disappointment", "freq": "446.240", "offset": "-", "tone": "100", "lat": 34.2467, "lon": -118.104, "status": "Online", "band": "70cm"},
-        {"name": "LAX103", "darn": "DARN 3", "location": "Mt. Wilson", "freq": "446.940", "offset": "-", "tone": "100", "lat": 34.2265, "lon": -118.067, "status": "Online", "band": "70cm"},
-        {"name": "LAX104", "darn": "DARN 4", "location": "Verdugo Peak", "freq": "445.260", "offset": "-", "tone": "100", "lat": 34.2172, "lon": -118.283, "status": "Online", "band": "70cm"},
-        {"name": "LAX105", "darn": "DARN 5", "location": "Saddle Peak", "freq": "445.820", "offset": "-", "tone": "100", "lat": 34.0763, "lon": -118.658, "status": "Online", "band": "70cm"},
-        {"name": "LAX106", "darn": "DARN 6", "location": "San Pedro Hill", "freq": "445.280", "offset": "-", "tone": "100", "lat": 33.7457, "lon": -118.3361, "status": "Online", "band": "70cm"},
-        {"name": "LAX107", "darn": "DARN 7", "location": "Santiago Peak", "freq": "448.920", "offset": "-", "tone": "114.8", "lat": 33.71, "lon": -117.53, "status": "Online", "band": "70cm"},
-        {"name": "LAX108", "darn": "DARN 8", "location": "TBD", "freq": "445.260", "offset": "-", "tone": "107.2", "lat": 34.10, "lon": -118.20, "status": "Offline", "band": "70cm"},
-        {"name": "LAX109", "darn": "DARN 9", "location": "Otay Mountain", "freq": "447.440", "offset": "-", "tone": "91.5", "lat": 32.5952, "lon": -116.8445, "status": "Offline", "band": "70cm"},
-        {"name": "LAX110", "darn": "DARN 10", "location": "Loop Canyon", "freq": "449.640", "offset": "-", "tone": "114.8", "lat": 34.353, "lon": -118.417, "status": "Online", "band": "70cm"},
-        {"name": "LAX111", "darn": "DARN 11", "location": "Santa Ynez Peak", "freq": "448.920", "offset": "-", "tone": "107.2", "lat": 34.52, "lon": -119.98, "status": "Offline", "band": "70cm"},
-        {"name": "LAX112", "darn": "DARN 12", "location": "Cougar Peak", "freq": "447.360", "offset": "-", "tone": "91.5", "lat": 33.16, "lon": -116.78, "status": "Online", "band": "70cm"},
-        {"name": "LAX113", "darn": "DARN 13", "location": "Johnstone Peak", "freq": "447.600", "offset": "-", "tone": "100", "lat": 34.15, "lon": -117.80, "status": "Online", "band": "70cm"},
-        {"name": "LAX114", "darn": "DARN 14", "location": "Toro Peak", "freq": "445.280", "offset": "-", "tone": "114.8", "lat": 33.52, "lon": -116.42, "status": "Online", "band": "70cm"},
-        {"name": "LAX115", "darn": "DARN 15", "location": "Mt. San Miguel", "freq": "446.940", "offset": "-", "tone": "91.5", "lat": 32.70, "lon": -116.94, "status": "Online", "band": "70cm"},
-        {"name": "LAX116", "darn": "DARN 16", "location": "Mt. Woodson", "freq": "447.240", "offset": "-", "tone": "91.5", "lat": 33.01, "lon": -116.97, "status": "Online", "band": "70cm"},
-        {"name": "LAX117", "darn": "DARN 17", "location": "Mt. Soledad", "freq": "447.280", "offset": "-", "tone": "91.5", "lat": 32.84, "lon": -117.24, "status": "Degraded", "band": "70cm"},
-        {"name": "LAX118", "darn": "DARN 18", "location": "Blue Ridge", "freq": "447.360", "offset": "-", "tone": "100", "lat": 34.3519, "lon": -117.6747, "status": "Online", "band": "70cm"},
-        {"name": "LAX119", "darn": "DARN 19", "location": "Sulphur Mountain", "freq": "447.280", "offset": "-", "tone": "107.2", "lat": 34.40, "lon": -119.17, "status": "Online", "band": "70cm"},
-        {"name": "LAX120", "darn": "DARN 20", "location": "Edom Hill", "freq": "447.240", "offset": "-", "tone": "136.5", "lat": 33.92, "lon": -116.35, "status": "Online", "band": "70cm"},
-        {"name": "LAX121", "darn": "DARN 21", "location": "Red Mountain", "freq": "446.740", "offset": "-", "tone": "91.5", "lat": 35.35, "lon": -117.62, "status": "Online", "band": "70cm"},
-        {"name": "LAX122", "darn": "DARN 22", "location": "Ord Mountain", "freq": "446.940", "offset": "-", "tone": "114.8", "lat": 34.62, "lon": -116.87, "status": "Online", "band": "70cm"},
-        {"name": "LAX123", "darn": "DARN 23", "location": "Hauser Peak", "freq": "447.380", "offset": "-", "tone": "100", "lat": 34.5474, "lon": -118.2168, "status": "Online", "band": "70cm"},
-        {"name": "LAX124", "darn": "DARN 24", "location": "South Mountain", "freq": "447.440", "offset": "-", "tone": "114.8", "lat": 34.25, "lon": -119.00, "status": "Online", "band": "70cm"},
-        {"name": "LAX125", "darn": "DARN 25", "location": "Low Potosi", "freq": "446.075", "offset": "-", "tone": "100", "lat": 35.97, "lon": -115.52, "status": "Online", "band": "70cm"},
-        {"name": "LAX126", "darn": "DARN 26", "location": "Palomar Mountain", "freq": "445.260", "offset": "-", "tone": "91.5", "lat": 33.3567, "lon": -116.8667, "status": "Online", "band": "70cm"},
-        {"name": "LAX127", "darn": "DARN 27", "location": "Orcutt Ridge", "freq": "446.740", "offset": "-", "tone": "107.2", "lat": 34.87, "lon": -120.43, "status": "Online", "band": "70cm"},
-        {"name": "LAX128", "darn": "DARN 28", "location": "Rasnow Peak", "freq": "447.360", "offset": "-", "tone": "107.2", "lat": 34.26, "lon": -118.72, "status": "Offline", "band": "70cm"},
-        {"name": "LAX129", "darn": "DARN 29", "location": "Simi Valley", "freq": "447.600", "offset": "-", "tone": "107.2", "lat": 34.27, "lon": -118.78, "status": "Online", "band": "70cm"},
-        # 2M Repeaters (DARN 50-59) - +0.6 MHz offset, lat offset +0.005 to avoid map overlap
-        {"name": "LAX150", "darn": "DARN 50", "location": "Voting Receiver", "freq": "147.360", "offset": "+", "tone": "100", "lat": 34.10, "lon": -118.20, "status": "Online", "band": "2m"},
-        {"name": "LAX151", "darn": "DARN 51", "location": "Palos Verdes", "freq": "147.360", "offset": "+", "tone": "114.8", "lat": 33.745, "lon": -118.39, "status": "Online", "band": "2m"},
-        {"name": "LAX152", "darn": "DARN 52", "location": "Mt. Disappointment", "freq": "147.360", "offset": "+", "tone": "100", "lat": 34.2517, "lon": -118.104, "status": "Online", "band": "2m"},
-        {"name": "LAX153", "darn": "DARN 53", "location": "Mt. Wilson", "freq": "147.360", "offset": "+", "tone": "CSQ", "lat": 34.2315, "lon": -118.067, "status": "Online", "band": "2m"},
-        {"name": "LAX154", "darn": "DARN 54", "location": "Verdugo Peak", "freq": "147.360", "offset": "+", "tone": "107.2", "lat": 34.2222, "lon": -118.283, "status": "Online", "band": "2m"},
-        {"name": "LAX159", "darn": "DARN 59", "location": "Otay Mountain", "freq": "147.300", "offset": "+", "tone": "91.5", "lat": 32.6002, "lon": -116.8445, "status": "Offline", "band": "2m"},
-        # 6M Repeaters (DARN 62-65) - -0.6 MHz offset, lat offset -0.005 to avoid map overlap
-        {"name": "LAX162", "darn": "DARN 62", "location": "Mt. Disappointment", "freq": "51.96", "offset": "-", "tone": "100", "lat": 34.2417, "lon": -118.104, "status": "Degraded", "band": "6m"},
-        {"name": "LAX165", "darn": "DARN 65", "location": "Mt. San Miguel", "freq": "53.66", "offset": "-", "tone": "107.2", "lat": 32.695, "lon": -116.94, "status": "Online", "band": "6m"},
-        # 1.25M (220 MHz) Repeaters (DARN 222-229) - -1.6 MHz offset, lon offset +0.005 to avoid map overlap
-        {"name": "LAX222", "darn": "DARN 222", "location": "Mt. Disappointment", "freq": "224.560", "offset": "-", "tone": "114.8", "lat": 34.2467, "lon": -118.099, "status": "Online", "band": "1.25m"},
-        {"name": "LAX223", "darn": "DARN 223", "location": "Johnstone Peak", "freq": "224.840", "offset": "-", "tone": "114.8", "lat": 34.15, "lon": -117.795, "status": "Online", "band": "1.25m"},
-        {"name": "LAX225", "darn": "DARN 225", "location": "Saddle Peak", "freq": "224.980", "offset": "-", "tone": "114.8", "lat": 34.0763, "lon": -118.653, "status": "Online", "band": "1.25m"},
-        {"name": "LAX229", "darn": "DARN 229", "location": "Otay Mountain", "freq": "224.840", "offset": "-", "tone": "91.5", "lat": 32.5952, "lon": -116.8395, "status": "Offline", "band": "1.25m"},
-    ]
-    
-    def _rx_toggle_darn(self, state):
-        """Toggle DARN emergency repeaters from RX page checkbox"""
-        enabled = state == Qt.CheckState.Checked.value
-        if enabled:
-            self._show_darn_repeaters()
-        else:
-            if self.map_ready:
-                self.map.page().runJavaScript("clearDarn()")
-    
-    def _show_darn_repeaters(self):
-        """Show DARN emergency repeater network on map"""
-        self._log("🔴 Showing DARN repeater network...")
-        
-        if not self.map_ready:
-            self._log("❌ Map not ready")
-            return
-        
-        # Clear existing
-        self.map.page().runJavaScript("clearDarn()")
-        
-        # Always use built-in data (41 repeaters from LAXNORTHEAST)
-        darn_data = self.DARN_REPEATERS
-        self._log(f"🔴 Using built-in DARN data ({len(darn_data)} repeaters)")
-        
-        import json
-        count = 0
-        for r in darn_data:
-            lat = r.get("lat", 0)
-            lon = r.get("lon", 0)
-            if lat == 0 or lon == 0:
-                continue
-            
-            name = str(r.get("name", ""))
-            darn = str(r.get("darn", ""))
-            location = str(r.get("location", ""))
-            band = str(r.get("band", ""))
-            rx_freq = str(r.get("rx_freq", r.get("freq", "")))
-            offset = str(r.get("offset", ""))
-            tx_freq = str(r.get("tx_freq", ""))
-            tone = str(r.get("tone", ""))
-            status = str(r.get("status", "Unknown"))
-            
-            # Status indicator
-            if status == "Online":
-                status_icon = "🟢"
-            elif status == "Degraded":
-                status_icon = "🟡"
-            else:
-                status_icon = "🔴"
-            
-            # Build tooltip
-            tooltip = f"<b>🚨 {name} - {darn}</b><br>"
-            tooltip += f"<b>Location:</b> {location}<br>"
-            if band:
-                tooltip += f"<b>Band:</b> {band}<br>"
-            tooltip += f"<b>Freq:</b> {rx_freq}{offset} MHz<br>"
-            if tx_freq:
-                tooltip += f"<b>TX:</b> {tx_freq} MHz<br>"
-            if tone:
-                tooltip += f"<b>Tone:</b> {tone} Hz<br>"
-            tooltip += f"<b>Status:</b> {status_icon} {status}<br>"
-            tooltip += "<i>DARN Emergency Network</i>"
-            
-            # Use JSON encoding for proper escaping
-            name_js = json.dumps(name)
-            tooltip_js = json.dumps(tooltip)
-            status_js = json.dumps(status)
-            
-            js = f"addDarn({lat},{lon},{name_js},{name_js},{tooltip_js},{status_js})"
-            self.map.page().runJavaScript(js)
-            count += 1
-        
-        self._log(f"🔴 Showing {count} DARN repeaters")
-    
-    def _rx_toggle_fires(self, state):
-        """Toggle fire layer from RX page checkbox"""
-        enabled = state == Qt.CheckState.Checked.value
-        
-        # Sync with Settings tab checkbox
-        if hasattr(self, 'fire_enabled'):
-            self.fire_enabled.blockSignals(True)
-            self.fire_enabled.setChecked(enabled)
-            self.fire_enabled.blockSignals(False)
-        
-        if enabled:
-            # Check for API key
-            api_key = self.fire_api_key.text().strip() if hasattr(self, 'fire_api_key') else ""
-            if not api_key:
-                self._log("🔥 Fire layer requires API key - set in Settings tab")
-                self.rx_fire_check.blockSignals(True)
-                self.rx_fire_check.setChecked(False)
-                self.rx_fire_check.blockSignals(False)
-                return
-            self._toggle_fire_monitor(Qt.CheckState.Checked.value)
-        else:
-            self._toggle_fire_monitor(Qt.CheckState.Unchecked.value)
-    
-    def _rx_toggle_quakes(self, state):
-        """Toggle earthquake layer from RX page checkbox"""
-        enabled = state == Qt.CheckState.Checked.value
-        
-        # Sync with Settings tab checkbox
-        if hasattr(self, 'quake_enabled'):
-            self.quake_enabled.blockSignals(True)
-            self.quake_enabled.setChecked(enabled)
-            self.quake_enabled.blockSignals(False)
-        
-        self._toggle_earthquake_monitor(Qt.CheckState.Checked.value if enabled else Qt.CheckState.Unchecked.value)
-    
-    def _rx_toggle_aqi(self, state):
-        """Toggle AQI layer from RX page checkbox"""
-        enabled = state == Qt.CheckState.Checked.value
-        
-        # Sync with Settings tab checkbox
-        if hasattr(self, 'aqi_enabled'):
-            self.aqi_enabled.blockSignals(True)
-            self.aqi_enabled.setChecked(enabled)
-            self.aqi_enabled.blockSignals(False)
-        
-        self._toggle_aqi_monitor(Qt.CheckState.Checked.value if enabled else Qt.CheckState.Unchecked.value)
-    
-    def _build_aprs_filter(self):
-        """Build APRS-IS filter string from location and radius"""
-        # Get radius from settings
-        radius = self.settings_aprs_radius.value() if hasattr(self, 'settings_aprs_radius') else 100
-        
-        # Get location - try GPS first, then manual
-        lat, lon = None, None
-        if hasattr(self, 'gps_lat') and self.gps_lat is not None:
-            lat, lon = self.gps_lat, self.gps_lon
-        elif hasattr(self, 'manual_location'):
-            manual_text = self.manual_location.text().strip()
-            if manual_text:
-                try:
-                    parts = manual_text.replace(" ", "").split(",")
-                    if len(parts) == 2:
-                        lat, lon = float(parts[0]), float(parts[1])
-                except ValueError:
-                    pass
-        
-        # Fallback to default LA coordinates
-        if lat is None or lon is None:
-            lat, lon = 34.05, -118.25
-        
-        return f"r/{lat:.2f}/{lon:.2f}/{radius}"
-    
-    def toggle_aprs_is(self):
-        """Connect or disconnect from APRS-IS server"""
-        if self.aprs_is_running:
-            # Disconnect
-            self.aprs_is_running = False
-            self.aprs_is_connected = False  # Clear connection flag
-            if self.aprs_is_socket:
-                try:
-                    self.aprs_is_socket.close()
-                except OSError:
-                    pass  # Socket already closed
-                self.aprs_is_socket = None
-            self.aprs_is_connect_btn.setText("🌐 START IS")
-            self.aprs_is_status.setStyleSheet("color: #ff6b6b; font-size: 14px;")
-            self.aprs_is_info_label.setText("")
-            self._log("🌐 Disconnected from APRS-IS")
-            # Sync settings tab status
-            if hasattr(self, 'settings_aprs_status'):
-                self.settings_aprs_status.setText("⚫ Disconnected")
-                self.settings_aprs_status.setStyleSheet("color: #ef5350;")
-                self.settings_aprs_connect_btn.setText("Connect")
-            # Sync APRS tab connection status
-            self._sync_beacon_connection_status()
-        else:
-            # Sync from Settings tab if available
-            if hasattr(self, 'settings_aprs_server'):
-                self.aprs_is_server.setText(self.settings_aprs_server.text())
-            if hasattr(self, 'settings_aprs_port'):
-                self.aprs_is_port.setValue(self.settings_aprs_port.value())
-            
-            # Build filter from radius and location
-            self.aprs_is_filter.setText(self._build_aprs_filter())
-            
-            # Connect
-            server = self.aprs_is_server.text().strip()
-            port = self.aprs_is_port.value()
-            filter_str = self.aprs_is_filter.text().strip()
-            
-            # Get callsign for login
-            callsign = self.callsign_edit.text().strip().upper()
-            if not callsign or callsign == "N0CALL":
-                QMessageBox.warning(self, "Error", "Set your callsign first in the Transmit tab")
-                return
-            
-            self._log(f"🌐 Connecting to APRS-IS: {server}:{port}")
-            self.aprs_is_info_label.setText(f"{server}:{port}")
-            
-            # Start connection thread
-            import socket
-            self.aprs_is_thread = threading.Thread(
-                target=self._aprs_is_worker,
-                args=(server, port, callsign, filter_str),
-                daemon=True
-            )
-            self.aprs_is_running = True
-            self.aprs_is_thread.start()
-            
-            self.aprs_is_connect_btn.setText("■ STOP IS")
-            self.aprs_is_status.setStyleSheet("color: #ffb74d; font-size: 14px;")  # Yellow = connecting
-    
-    def _aprs_is_worker(self, server, port, callsign, filter_str):
-        """Background thread for APRS-IS connection"""
-        import socket
-        
-        try:
-            self.aprs_is_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.aprs_is_socket.settimeout(10)
-            self.aprs_is_socket.connect((server, port))
-            
-            # Login (use passcode if provided, otherwise -1 for read-only)
-            passcode = "-1"
-            if hasattr(self, 'settings_aprs_passcode'):
-                pc = self.settings_aprs_passcode.text().strip()
-                if pc:
-                    passcode = pc
-            
-            login = f"user {callsign} pass {passcode} vers PyTNC 019"
-            if filter_str:
-                login += f" filter {filter_str}"
-            login += "\r\n"
-            
-            self.aprs_is_socket.send(login.encode())
-            
-            # Update status on main thread via signal
-            self.aprs_is_connected_signal.emit()
-            
-            # Read loop
-            buffer = ""
-            self.aprs_is_socket.settimeout(1)
-            
-            while self.aprs_is_running:
-                try:
-                    data = self.aprs_is_socket.recv(1024)
-                    if not data:
-                        break
-                    
-                    buffer += data.decode('latin-1', errors='ignore')
-                    
-                    while '\r\n' in buffer:
-                        line, buffer = buffer.split('\r\n', 1)
-                        if line and not line.startswith('#'):
-                            # Parse APRS-IS packet via signal
-                            try:
-                                self.aprs_is_packet_signal.emit(line)
-                            except RuntimeError:
-                                # Window was closed
-                                self.aprs_is_running = False
-                                return
-                            
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.aprs_is_running:
-                        try:
-                            self.aprs_is_error_signal.emit(f"⚠️ APRS-IS error: {e}")
-                        except RuntimeError:
-                            pass
-                    break
-                    
-        except Exception as e:
-            try:
-                self.aprs_is_error_signal.emit(f"❌ APRS-IS connection failed: {e}")
-            except RuntimeError:
-                pass
-        
-        finally:
-            self.aprs_is_running = False
-            try:
-                self.aprs_is_disconnected_signal.emit()
-            except RuntimeError:
-                pass
-    
-    def _aprs_is_connected(self):
-        """Called when APRS-IS connects successfully"""
-        self.aprs_is_connected = True  # Set connection flag for status panel
-        self.aprs_is_status.setStyleSheet("color: #69f0ae; font-size: 14px;")  # Green
-        self.aprs_is_connect_btn.setText("■ STOP IS")
-        self._log("✅ Connected to APRS-IS")
-        # Sync settings tab status
-        if hasattr(self, 'settings_aprs_status'):
-            self.settings_aprs_status.setText("🟢 Connected")
-            self.settings_aprs_status.setStyleSheet("color: #69f0ae;")
-            self.settings_aprs_connect_btn.setText("Disconnect")
-        self._sync_beacon_connection_status()
-    
-    def _aprs_is_disconnected(self):
-        """Called when APRS-IS disconnects"""
-        self.aprs_is_connected = False  # Clear connection flag
-        self.aprs_is_connect_btn.setText("🌐 START IS")
-        self.aprs_is_status.setStyleSheet("color: #ff6b6b; font-size: 14px;")
-        self.aprs_is_info_label.setText("")
-        # Sync settings tab status
-        if hasattr(self, 'settings_aprs_status'):
-            self.settings_aprs_status.setText("⚫ Disconnected")
-            self.settings_aprs_status.setStyleSheet("color: #ef5350;")
-            self.settings_aprs_connect_btn.setText("Connect")
-        # Sync APRS tab connection status
-        self._sync_beacon_connection_status()
-    
-    def _handle_aprs_is_packet(self, line):
-        """Handle incoming APRS-IS packet"""
-        try:
-            # Parse: CALL>TOCALL,PATH:payload
-            if '>' not in line or ':' not in line:
-                return
-            
-            src, rest = line.split('>', 1)
-            path_part, payload = rest.split(':', 1)
-            
-            # Extract destination and path
-            path_parts = path_part.split(',')
-            dst = path_parts[0] if path_parts else ""
-            via = ','.join(path_parts[1:]) if len(path_parts) > 1 else ""
-            
-            # Check if this is OUR OWN packet coming back
-            my_call = self.callsign_edit.text().strip().upper()
-            my_ssid = self.ssid_combo.currentData()
-            my_full = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
-            
-            if callsigns_match(src, my_full):
-                # Our packet! Show the path it took
-                # Find digis that actually repeated it (marked with *)
-                digis_used = [p.rstrip('*') for p in path_parts[1:] if '*' in p and not p.startswith(('qA', 'TCPIP'))]
-                if digis_used:
-                    digi_str = ' → '.join(digis_used)
-                    self._log(f"<span style='color:#69f0ae;font-weight:bold'>📡 YOUR PACKET via: {digi_str}</span>")
-                else:
-                    # Check for qAR (heard by IGate)
-                    for p in path_parts:
-                        if p.startswith('qAR') or p.startswith('qAO'):
-                            # Next part is the IGate
-                            idx = path_parts.index(p)
-                            if idx + 1 < len(path_parts):
-                                igate = path_parts[idx + 1]
-                                self._log(f"<span style='color:#69f0ae;font-weight:bold'>📡 YOUR PACKET heard by IGate: {igate}</span>")
-                            break
-            
-            # Track digipeater usage
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            for digi in path_parts[1:]:
-                # Remove * from used digis
-                digi_clean = digi.rstrip('*').upper()
-                if digi_clean and not digi_clean.startswith(('TCPIP', 'qA', 'WIDE', 'RELAY')):
-                    if digi_clean not in self.digi_traffic:
-                        self.digi_traffic[digi_clean] = []
-                    # Keep last 20 stations per digi
-                    self.digi_traffic[digi_clean].append((src, timestamp))
-                    self.digi_traffic[digi_clean] = self.digi_traffic[digi_clean][-20:]
-            
-            # Log to main feed - gold callsign BOLD, rest normal, blue globe indicates internet
-            self._log(f"🌐 <a href='aprs://pan/{src}' style='color:#ffd54f;text-decoration:none;font-weight:bold'>{src}</a><span style='color:#ffd54f'>&gt;{dst} via {via}</span>")
-            
-            # Update packet counter
-            self.packets += 1
-            self.pkt_lbl.setText(f"Packets: {self.packets}")
-            
-            # Capture status packets (>) for later use and log to feed
-            if payload.startswith('>'):
-                status_text = payload[1:].strip()
-                self.station_status[src] = status_text
-                clean_status = clean_aprs_comment(status_text, 80)
-                if clean_status:
-                    self._log(f"  📝 {clean_status}", "#64b5f6")
-            
-            # Check for messages addressed to us
-            my_call = self.callsign_edit.text().strip().upper()
-            my_ssid = self.ssid_combo.currentData()
-            my_full = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
-            
-            if payload.startswith(':'):
-                # APRS message format: :ADDRESSEE:message (addressee is exactly 9 chars, space-padded)
-                # Use precompiled spec-compliant regex for linear-time matching
-                m = _APRS_MSG_RE.match(payload)
-                if m:
-                    msg_dest = m.group("addressee").strip().upper()  # Normalize: strip padding + uppercase
-                    msg_content = m.group("text")  # Keep original (can include colons, etc.)
-                    
-                    # Guard against empty addressees (but allow bulletins like BLN1, BLN2)
-                    if msg_dest:
-                        # Flexible callsign matching using helper function
-                        is_for_me = callsigns_match(msg_dest, my_full)
-                        
-                        if is_for_me:
-                            # Check if it's an ack
-                            if msg_content.startswith('ack'):
-                                seq = msg_content[3:].strip()
-                                self._handle_ack(src, seq)
-                            elif msg_content.startswith('rej'):
-                                seq = msg_content[3:].strip()
-                                self._log(f"❌ Message {seq} rejected by {src}")
-                            elif msg_content:  # Only process non-empty messages
-                                # Regular message - extract sequence number
-                                seq = None
-                                if '{' in msg_content:
-                                    msg_text, seq = msg_content.rsplit('{', 1)
-                                    seq = seq.strip()
-                                else:
-                                    msg_text = msg_content
-                                
-                                self._handle_incoming_message(src, msg_dest, msg_text.strip(), seq)
-            
-            # Try to extract position and add to map
-            self._parse_aprs_is_position(src, dst, via, payload)
-            
-        except Exception as e:
-            # Log parse errors for debugging (but don't spam)
-            if hasattr(self, '_aprs_parse_errors'):
-                self._aprs_parse_errors += 1
-            else:
-                self._aprs_parse_errors = 1
-            if self._aprs_parse_errors <= 10:
-                self._log(f"⚠️ APRS-IS parse: {e}")
-    
-    def _parse_aprs_is_position(self, callsign, dst, via, payload):
-        """Extract position from APRS-IS payload and add to map with detailed tooltip"""
-        try:
-            if len(payload) < 1:
-                return
-            
-            data_type = payload[0]
-            lat = lon = None
-            sym_table = "/"
-            sym_code = ">"
-            comment = ""
-            speed_mph = None
-            course = None
-            altitude_ft = None
-            weather = {}
-            
-            # Parse different APRS formats
-            if data_type in '!=':
-                # Position without timestamp: !lat/lonScomment or =lat/lonScomment
-                # Could be uncompressed (starts with digit) or compressed (starts with symbol table)
-                pos_data = payload[1:]
-                if len(pos_data) >= 13 and pos_data[0] in '/\\ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                    # Compressed format
-                    lat, lon, sym_table, sym_code, comment, speed_mph, course = self._parse_compressed_pos(pos_data)
-                elif len(payload) >= 20:
-                    lat, lon, sym_table, sym_code, comment = self._parse_uncompressed_pos(payload[1:])
-                    # Check for CSE/SPD extension (course/speed)
-                    if len(comment) >= 7 and comment[3] == '/':
-                        try:
-                            course = int(comment[0:3])
-                            speed_mph = int(comment[4:7]) * 1.15078  # knots to mph
-                            comment = comment[7:].strip()
-                        except (ValueError, IndexError):
-                            pass  # CSE/SPD format not valid - keep original comment
-            
-            elif data_type in '/@':
-                # Position with timestamp: /timestamp lat/lonScomment or @timestamp lat/lonScomment
-                # Could be uncompressed or compressed
-                pos_data = payload[8:] if len(payload) >= 8 else ""
-                if len(pos_data) >= 13 and pos_data[0] in '/\\ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                    # Compressed format
-                    lat, lon, sym_table, sym_code, comment, speed_mph, course = self._parse_compressed_pos(pos_data)
-                elif len(payload) >= 27:
-                    timestamp = payload[1:8]
-                    lat, lon, sym_table, sym_code, comment = self._parse_uncompressed_pos(payload[8:])
-                    # Check for CSE/SPD
-                    if len(comment) >= 7 and comment[3] == '/':
-                        try:
-                            course = int(comment[0:3])
-                            speed_mph = int(comment[4:7]) * 1.15078
-                            comment = comment[7:].strip()
-                        except (ValueError, IndexError):
-                            pass  # CSE/SPD format not valid
-            
-            elif data_type == '_':
-                # Weather report
-                # Try to extract position from weather packet
-                pass  # Weather without position
-            
-            elif data_type == ';':
-                # Object
-                if len(payload) >= 31:
-                    obj_name = payload[1:10].strip()
-                    # Check if live (*) or killed (_)
-                    if payload[10] == '*':
-                        lat, lon, sym_table, sym_code, comment = self._parse_uncompressed_pos(payload[18:])
-                        callsign = obj_name  # Use object name
-            
-            elif data_type == '`' or data_type == "'":
-                # Mic-E format - complex encoding
-                lat, lon, speed_mph, course, sym_table, sym_code = self._parse_mice(dst, payload)
-            
-            # Check for altitude in comment /A=xxxxxx (exactly 6 digits per APRS spec)
-            if comment:
-                import re
-                alt_match = re.search(r'/A=(-?\d{6})', comment)
-                if alt_match:
-                    altitude_ft = int(alt_match.group(1))
-                    comment = re.sub(r'/A=-?\d{6}', '', comment).strip()
-                
-                # Check for weather data in comment - multiple formats
-                # Format 1: DDD/SSS[gGGG]tTTT (wind dir/speed, optional gust, temp)
-                wx_match = re.search(r'(\d{3})/(\d{3})(?:g(\d{3}))?t(-?\d{3})', comment)
-                if wx_match:
-                    weather['wind_dir'] = int(wx_match.group(1))
-                    weather['wind_speed'] = int(wx_match.group(2))
-                    if wx_match.group(3):  # Gust is optional
-                        weather['wind_gust'] = int(wx_match.group(3))
-                    weather['temp_f'] = int(wx_match.group(4))
-                
-                # Format 2: Positionless weather - gXXXtXXXrXXXpXXXPXXXhXXbXXXXX
-                # g=gust, t=temp, r=rain/hr, p=rain/24h, P=rain/midnight, h=humidity, b=baro, L=luminosity
-                # Also handles: cDDD = wind direction, sSSS = wind speed (sustained)
-                if 't' in comment and not weather:
-                    # Temperature
-                    t_match = re.search(r't(-?\d{3})', comment)
-                    if t_match:
-                        weather['temp_f'] = int(t_match.group(1))
-                    
-                    # Humidity
-                    h_match = re.search(r'h(\d{2})', comment)
-                    if h_match:
-                        h_val = int(h_match.group(1))
-                        weather['humidity'] = 100 if h_val == 0 else h_val
-                    
-                    # Barometric pressure
-                    b_match = re.search(r'b(\d{5})', comment)
-                    if b_match:
-                        weather['baro_mb'] = int(b_match.group(1)) / 10.0
-                    
-                    # Wind direction (cDDD)
-                    c_match = re.search(r'c(\d{3})', comment)
-                    if c_match:
-                        weather['wind_dir'] = int(c_match.group(1))
-                    
-                    # Wind speed (sSSS) - sustained
-                    s_match = re.search(r's(\d{3})', comment)
-                    if s_match:
-                        weather['wind_speed'] = int(s_match.group(1))
-                    
-                    # Wind gust
-                    g_match = re.search(r'g(\d{3})', comment)
-                    if g_match:
-                        weather['wind_gust'] = int(g_match.group(1))
-                    
-                    # Rain last hour (hundredths of inch)
-                    r_match = re.search(r'r(\d{3})', comment)
-                    if r_match:
-                        weather['rain_1h'] = int(r_match.group(1)) / 100.0
-                    
-                    # Luminosity
-                    l_match = re.search(r'[Ll](\d{3})', comment)
-                    if l_match:
-                        weather['luminosity'] = int(l_match.group(1))
-                
-                # Clean up comment - ALWAYS remove weather tokens if weather was parsed
-                # This runs regardless of which format matched
-                if weather:
-                    # Weather formats to remove:
-                    # 1. DDD/SSSgGGGtTTT... format (can start with .../... for unknown)
-                    # 2. Concatenated tokens: c180s005g010t072h65b10234
-                    
-                    # First, remove the DDD/SSS[gGGG]tTTT... pattern at start (including .../... for unknown)
-                    comment = re.sub(r'^\.{0,3}/\d{3}', '', comment)  # Remove .../000 or /000
-                    comment = re.sub(r'^\d{3}/\d{3}', '', comment)    # Remove DDD/SSS
-                    
-                    # Weather tokens pattern
-                    weather_tokens = r'(?:b\d{5}|[Ll]\d{3}|#\d{3,5}|c\d{3}|s\d{3}|g\d{3}|t-?\d{3}|r\d{3}|p\d{3}|P\d{3}|h\d{2})'
-                    # Remove concatenated weather block at start
-                    comment = re.sub(r'^' + weather_tokens + r'+', '', comment)
-                    # Remove standalone tokens elsewhere - require word boundaries on BOTH sides
-                    comment = re.sub(r'(?<!\w)' + weather_tokens + r'(?!\w)', '', comment)
-                    # Clean up any leading dots or slashes left over
-                    comment = re.sub(r'^[./]+', '', comment)
-                    comment = ' '.join(comment.split())  # Collapse extra whitespace
-            
-            # Parse PHG (Power-Height-Gain-Directivity) code
-            phg_info = None
-            if comment:
-                phg_match = re.search(r'PHG(\d)(\d)(\d)(\d)', comment)
-                if phg_match:
-                    p, h, g, d = [int(x) for x in phg_match.groups()]
-                    # Power in watts: 0,1,4,9,16,25,36,49,64,81
-                    power_watts = p * p
-                    # Height in feet: 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120
-                    height_ft = 10 * (2 ** h)
-                    # Gain in dBi
-                    gain_dbi = g
-                    # Directivity: 0=omni, 1=45NE, 2=90E, 3=135SE, 4=180S, 5=225SW, 6=270W, 7=315NW, 8=360N
-                    dir_names = ['omni', '45° NE', '90° E', '135° SE', '180° S', '225° SW', '270° W', '315° NW', '360° N']
-                    directivity = dir_names[d] if d < len(dir_names) else 'omni'
-                    phg_info = f"{power_watts}W, {height_ft}ft HAAT, {gain_dbi}dBi {directivity}"
-                    # Remove PHG from comment
-                    comment = re.sub(r'PHG\d{4}/?', '', comment).strip()
-            
-            # Parse grid square (Maidenhead locator)
-            grid_square = None
-            if comment:
-                grid_match = re.search(r'\b([A-R]{2}\d{2}[a-x]{0,2})\b', comment, re.IGNORECASE)
-                if grid_match:
-                    grid_square = grid_match.group(1).upper()
-            
-            # If we got a valid position, add to map
-            if lat is not None and lon is not None:
-                # Get icon
-                ic, ov = icon_path(sym_table, sym_code)
-                if ov:
-                    ic = make_overlay(ic, ov)
-                
-                # Build URL
-                try:
-                    rel_path = ic.relative_to(BASE_DIR)
-                    icon_url = f"http://127.0.0.1:{self.http_port}/{rel_path.as_posix()}"
-                except ValueError:
-                    icon_url = f"http://127.0.0.1:{self.http_port}/aprs_symbols_48/primary/29.png"
-                
-                # Check if this is a digipeater
-                is_digi = False
-                ssid = callsign.split('-')[1] if '-' in callsign else ""
-                if ssid in ['10', '11', '12', '15']:
-                    is_digi = True
-                if sym_code == '#':  # Digi symbol
-                    is_digi = True
-                
-                # Build detailed tooltip (HTML) - callsign added separately as QRZ link
-                tooltip_parts = []
-                
-                if is_digi:
-                    tooltip_parts.append("📡 Digipeater")
-                    # Show recent traffic through this digi
-                    if callsign in self.digi_traffic and self.digi_traffic[callsign]:
-                        recent = self.digi_traffic[callsign][-5:]  # Last 5
-                        traffic_list = ", ".join([f"{s[0]}" for s in reversed(recent)])
-                        tooltip_parts.append(f"📶 Recent: {traffic_list}")
-                
-                # Device type from tocall
-                device = TOCALL_DEVICES.get(dst[:6], TOCALL_DEVICES.get(dst[:5], TOCALL_DEVICES.get(dst[:4], TOCALL_DEVICES.get(dst[:3], ""))))
-                if device:
-                    tooltip_parts.append(f"📻 {device}")
-                
-                # Grid square
-                if grid_square:
-                    tooltip_parts.append(f"🗺️ {grid_square}")
-                
-                # PHG info
-                if phg_info:
-                    tooltip_parts.append(f"📶 {phg_info}")
-                
-                # Speed and course
-                if speed_mph is not None and speed_mph > 0:
-                    speed_str = f"🚗 {speed_mph:.0f} mph"
-                    if course is not None:
-                        speed_str += f" @ {course}°"
-                    tooltip_parts.append(speed_str)
-                
-                # Altitude
-                if altitude_ft is not None:
-                    tooltip_parts.append(f"📍 {altitude_ft:,} ft")
-                
-                # Weather
-                if weather:
-                    if 'temp_f' in weather:
-                        tooltip_parts.append(f"🌡️ {weather['temp_f']}°F")
-                    if 'humidity' in weather:
-                        tooltip_parts.append(f"💧 {weather['humidity']}%")
-                    if 'wind_speed' in weather or 'wind_dir' in weather:
-                        wind_str = "💨"
-                        if 'wind_dir' in weather:
-                            wind_str += f" {weather['wind_dir']}°"
-                        if 'wind_speed' in weather:
-                            wind_str += f" {weather['wind_speed']} mph"
-                        if 'wind_gust' in weather and weather['wind_gust'] > 0:
-                            wind_str += f" (gust {weather['wind_gust']})"
-                        tooltip_parts.append(wind_str)
-                    if 'baro_mb' in weather:
-                        tooltip_parts.append(f"📊 {weather['baro_mb']:.1f} mb")
-                    if 'pressure_mb' in weather:
-                        tooltip_parts.append(f"📊 {weather['pressure_mb']:.1f} mb")
-                    # Rain - combine into one line if present
-                    rain_parts = []
-                    if 'rain_1h' in weather:
-                        rain_parts.append(f"{weather['rain_1h']:.2f}\"/1h")
-                    if 'rain_24h' in weather:
-                        rain_parts.append(f"{weather['rain_24h']:.2f}\"/24h")
-                    if rain_parts:
-                        tooltip_parts.append(f"🌧️ {' '.join(rain_parts)}")
-                
-                # Comment - show more and make URLs clickable
-                if comment and len(comment) > 2:
-                    # Clean weather tokens and HTML-escape
-                    clean_comment = clean_aprs_comment(comment, 120)
-                    # Make URLs clickable - exclude HTML chars and quotes from URL capture
-                    url_pattern = r'(https?://[^\s<>"\']+)'
-                    clean_comment = re.sub(url_pattern, r'<a href="\1" target="_blank" style="color:#64b5f6">\1</a>', clean_comment)
-                    if clean_comment:
-                        tooltip_parts.append(f"💬 {clean_comment}")
-                
-                # Via path is added by JS updateStation() for the popup
-                # Don't duplicate it here in the tooltip
-                
-                # Add cached status if we have one
-                if callsign in self.station_status:
-                    status_text = clean_aprs_comment(self.station_status[callsign], 150)
-                    if status_text:
-                        tooltip_parts.append(f"📝 {status_text}")
-                
-                # Add timestamp
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                tooltip_parts.append(f"🕐 {timestamp}")
-                
-                # Join with <br>
-                tooltip = "<br>".join(tooltip_parts)
-                
-                # Log comment to live feed (left column)
-                if comment and len(comment) > 2:
-                    clean_cmt = clean_aprs_comment(comment, 80)
-                    if clean_cmt:
-                        self._log(f"  💬 {clean_cmt}", "#64b5f6")
-                
-                # Use JSON encoding for proper escaping
-                import json
-                call_js = json.dumps(callsign)
-                tooltip_js = json.dumps(tooltip)
-                via_js = json.dumps(via if via else "")
-                is_digi_js = "true" if is_digi else "false"
-                
-                js = f"queueStation({call_js},{lat},{lon},'{icon_url}',{tooltip_js},{is_digi_js},{via_js})"
-                
-                if self.map_ready:
-                    self.map.page().runJavaScript(js)
-                else:
-                    self.pending_js.append(js)
-                    
-        except Exception as e:
-            pass  # Ignore parse errors
-    
-    def _parse_uncompressed_pos(self, data):
-        """Parse uncompressed APRS position: DDMM.MMN/DDDMM.MMWSymbol + comment"""
-        try:
-            if len(data) < 19:
-                return None, None, "/", ">", ""
-            
-            lat_str = data[0:7]
-            lat_dir = data[7]
-            sym_table = data[8]
-            lon_str = data[9:17]
-            lon_dir = data[17]
-            sym_code = data[18]
-            comment = data[19:] if len(data) > 19 else ""
-            
-            if lat_dir in 'NS' and lon_dir in 'EW':
-                lat = float(lat_str[:2]) + float(lat_str[2:]) / 60.0
-                if lat_dir == 'S':
-                    lat = -lat
-                lon = float(lon_str[:3]) + float(lon_str[3:]) / 60.0
-                if lon_dir == 'W':
-                    lon = -lon
-                return lat, lon, sym_table, sym_code, comment
-        except (ValueError, IndexError):
-            pass  # Invalid coordinate format - return defaults
-        return None, None, "/", ">", ""
-    
-    def _parse_compressed_pos(self, data):
-        """Parse compressed APRS position (base-91 encoded)
-        
-        Format: /YYYY XXXX $cs T  (13 chars total)
-        Where:
-        - / or \\ or A-Z: symbol table
-        - YYYY: latitude (4 chars, base-91)
-        - XXXX: longitude (4 chars, base-91)
-        - $: symbol code
-        - cs: course/speed or altitude (2 chars)
-        - T: compression type (optional)
-        """
-        try:
-            if len(data) < 13:
-                return None, None, "/", ">", "", None, None
-            
-            sym_table = data[0]
-            lat_chars = data[1:5]
-            lon_chars = data[5:9]
-            sym_code = data[9]
-            cs_chars = data[10:12] if len(data) >= 12 else "  "
-            t_byte = data[12] if len(data) >= 13 else ' '
-            comment = data[13:] if len(data) > 13 else ""
-            
-            # Decode base-91 latitude (90 - (c1-33)*91^3 + (c2-33)*91^2 + (c3-33)*91 + (c4-33)) / 380926
-            lat_val = 0
-            for i, c in enumerate(lat_chars):
-                lat_val = lat_val * 91 + (ord(c) - 33)
-            lat = 90.0 - (lat_val / 380926.0)
-            
-            # Decode base-91 longitude
-            lon_val = 0
-            for i, c in enumerate(lon_chars):
-                lon_val = lon_val * 91 + (ord(c) - 33)
-            lon = -180.0 + (lon_val / 190463.0)
-            
-            # Decode course/speed if present
-            speed_mph = None
-            course = None
-            
-            if cs_chars != "  " and cs_chars[0] != ' ':
-                c = ord(cs_chars[0]) - 33
-                s = ord(cs_chars[1]) - 33
-                
-                # Check compression type byte
-                t = ord(t_byte) - 33 if t_byte != ' ' else 0
-                
-                if t & 0x18 == 0x10:
-                    # NMEA source - cs is altitude
-                    pass
-                elif c >= 0 and c <= 89:
-                    # Course/speed
-                    course = c * 4
-                    speed_mph = (1.08 ** s - 1) * 1.15078  # knots to mph
-            
-            return lat, lon, sym_table, sym_code, comment, speed_mph, course
-            
-        except (ValueError, IndexError, TypeError):
-            pass  # Invalid compressed format - return defaults
-        return None, None, "/", ">", "", None, None
-    
-    def _parse_mice(self, dst, payload):
-        """Parse Mic-E encoded position from destination field"""
-        try:
-            # Mic-E encodes latitude in the destination field
-            # and longitude/speed/course in the payload
-            if len(dst) < 6 or len(payload) < 9:
-                return None, None, None, None, "/", ">"
-            
-            # Decode latitude from destination (6 chars)
-            lat_digits = ""
-            lat_dir = 'N'
-            lon_offset = 0
-            lon_dir = 'W'
-            
-            mice_chars = "0123456789 "  # Space for ambiguity
-            for i, c in enumerate(dst[:6]):
-                if c.isdigit():
-                    lat_digits += c
-                elif c in 'ABCDEFGHIJ':
-                    lat_digits += str(ord(c) - ord('A'))
-                elif c in 'KLMNOPQRSTUVWXYZ':
-                    lat_digits += str(ord(c) - ord('K'))
-                elif c in 'abcdefghij':
-                    lat_digits += str(ord(c) - ord('a'))
-                else:
-                    lat_digits += '0'
-                
-                # Bits 4,5,6 of dest encode N/S, lon offset, E/W
-                if i == 3:
-                    if c.isupper() or c.isdigit():
-                        lat_dir = 'N'
-                    else:
-                        lat_dir = 'S'
-                if i == 4:
-                    if c.isupper() or c.isdigit():
-                        lon_offset = 100
-                if i == 5:
-                    if c.isupper() or c.isdigit():
-                        lon_dir = 'W'
-                    else:
-                        lon_dir = 'E'
-            
-            # Parse latitude
-            lat = float(lat_digits[:2]) + float(lat_digits[2:4] + '.' + lat_digits[4:6]) / 60.0
-            if lat_dir == 'S':
-                lat = -lat
-            
-            # Parse longitude from payload (bytes 1-3)
-            d = ord(payload[1]) - 28 + lon_offset
-            if d >= 180 and d <= 189:
-                d -= 80
-            elif d >= 190 and d <= 199:
-                d -= 190
-            
-            m = ord(payload[2]) - 28
-            if m >= 60:
-                m -= 60
-            
-            h = ord(payload[3]) - 28
-            
-            lon = d + (m + h / 100.0) / 60.0
-            if lon_dir == 'W':
-                lon = -lon
-            
-            # Speed and course from bytes 4-5
-            sp = (ord(payload[4]) - 28) * 10
-            dc = ord(payload[5]) - 28
-            sp += dc // 10
-            course = (dc % 10) * 100 + (ord(payload[6]) - 28)
-            
-            speed_mph = sp * 1.15078  # knots to mph
-            if course >= 400:
-                course -= 400
-            
-            # Symbol from bytes 7-8
-            sym_code = payload[7]
-            sym_table = payload[8]
-            
-            return lat, lon, speed_mph, course, sym_table, sym_code
-            
-        except Exception as e:
-            return None, None, None, None, "/", ">"
-    
     def send_beacon(self):
         """Send an APRS beacon via radio - auto-connects PTT if needed"""
         # Check if sounddevice is available for RF transmit
@@ -7813,21 +5575,37 @@ class MainWindow(QMainWindow):
         
         # Auto-connect PTT if not connected
         ptt_auto_connected = False
-        if not self.ptt_serial or not self.ptt_serial.is_open:
-            ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
-            if ptt_port:
-                try:
-                    self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
-                    self._set_ptt(False)
-                    ptt_auto_connected = True
-                    self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
-                    self._update_tx_status()
-                except Exception as e:
-                    QMessageBox.warning(self, "PTT Connection Failed", f"Could not connect PTT:\n{e}\n\nConfigure in Settings tab.")
+        if not self._ptt_is_connected():
+            method = getattr(self, 'civ_ptt_method', 'RTS/DTR')
+            if method == "CI-V CAT":
+                ptt_port = self.civ_port_combo.currentData() if hasattr(self, 'civ_port_combo') else None
+                if ptt_port:
+                    try:
+                        self._toggle_civ()
+                        ptt_auto_connected = True
+                        self.preset_log.append(f"✅ Auto-connected CI-V PTT: {ptt_port}")
+                        self._update_tx_status()
+                    except Exception as e:
+                        QMessageBox.warning(self, "CI-V Connection Failed", f"Could not connect CI-V PTT:\n{e}\n\nConfigure in Settings tab.")
+                        return
+                else:
+                    QMessageBox.warning(self, "CI-V Not Configured", "Configure CI-V port in Settings tab first")
                     return
             else:
-                QMessageBox.warning(self, "PTT Not Configured", "Configure PTT port in Settings tab first")
-                return
+                ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
+                if ptt_port:
+                    try:
+                        self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
+                        self._set_ptt(False)
+                        ptt_auto_connected = True
+                        self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
+                        self._update_tx_status()
+                    except Exception as e:
+                        QMessageBox.warning(self, "PTT Connection Failed", f"Could not connect PTT:\n{e}\n\nConfigure in Settings tab.")
+                        return
+                else:
+                    QMessageBox.warning(self, "PTT Not Configured", "Configure PTT port in Settings tab first")
+                    return
         
         # Get TX audio OUTPUT device from Settings
         tx_device = self.settings_tx_audio_combo.currentData() if hasattr(self, 'settings_tx_audio_combo') else None
@@ -8065,8 +5843,8 @@ class MainWindow(QMainWindow):
             return
         
         # PTT status
-        if self.ptt_serial and self.ptt_serial.is_open:
-            self.tx_ptt_status.setText("🟢 PTT: Connected")
+        if self._ptt_is_connected():
+            self.tx_ptt_status.setText(f"🟢 PTT: {self._ptt_port_label()}")
             self.tx_ptt_status.setStyleSheet("color: #69f0ae;")
         else:
             self.tx_ptt_status.setText("⚫ PTT: Not connected")
@@ -8208,6 +5986,41 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'vara_log'):
                 self.vara_log.append(f"💾 Settings saved!")
             self._log("✅ Settings saved")
+            # Flash save buttons green with confirmation text
+            for btn_name in ('save_settings_btn',):
+                btn = getattr(self, btn_name, None)
+                if btn:
+                    btn.setText("✅ Saved!")
+                    btn.setStyleSheet("""
+                        QPushButton {
+                            background: #2e7d32; color: #fff;
+                            font-weight: bold; border-radius: 4px;
+                            padding: 4px 10px; border: 1px solid #4caf50;
+                        }
+                    """)
+                    QTimer.singleShot(1500, lambda b=btn: (
+                        b.setText("💾 Save"),
+                        b.setStyleSheet("""
+                            QPushButton {
+                                background: #1565c0; color: #fff;
+                                font-weight: bold; border-radius: 4px;
+                                padding: 4px 10px; border: 1px solid #1976d2;
+                            }
+                            QPushButton:hover { background: #1976d2; }
+                        """)
+                    ))
+            # Also flash the Settings tab save button if it exists
+            if hasattr(self, 'settings_save_btn'):
+                self.settings_save_btn.setText("✅ Saved!")
+                self.settings_save_btn.setStyleSheet("""
+                    QPushButton { background: #2e7d32; color: #fff;
+                        font-weight: bold; border-radius: 4px;
+                        padding: 4px 10px; border: 1px solid #4caf50; }
+                """)
+                QTimer.singleShot(1500, lambda: (
+                    self.settings_save_btn.setText("💾 Save Settings"),
+                    self.settings_save_btn.setStyleSheet(self._button_style("#f57c00", "#ff9800"))
+                ) if hasattr(self, 'settings_save_btn') else None)
         except Exception as e:
             self._log(f"⚠️ Failed to save settings: {e}")
             self.preset_log.append(f"❌ Failed to save: {e}")
@@ -8246,6 +6059,19 @@ class MainWindow(QMainWindow):
                 self.lat_edit.setValue(settings["latitude"])
             if "longitude" in settings:
                 self.lon_edit.setValue(settings["longitude"])
+            # Center map on saved position once the WebView is ready
+            if "latitude" in settings and "longitude" in settings:
+                _lat = float(settings["latitude"])
+                _lon = float(settings["longitude"])
+                def _center_map_on_load(lat=_lat, lon=_lon):
+                    try:
+                        self.map.page().runJavaScript(
+                            f"if(typeof setCenter === 'function') setCenter({lat}, {lon}, 12);"
+                        )
+                    except Exception:
+                        pass
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(2000, _center_map_on_load)
             if "comment" in settings:
                 self.comment_edit.setText(settings["comment"])
             if "radio" in settings:
@@ -8541,8 +6367,8 @@ class MainWindow(QMainWindow):
         """Sync APRS AX25 tab connection status with actual state"""
         # PTT status
         if hasattr(self, 'tx_ptt_status'):
-            if self.ptt_serial and self.ptt_serial.is_open:
-                self.tx_ptt_status.setText("🟢 PTT: Connected")
+            if self._ptt_is_connected():
+                self.tx_ptt_status.setText(f"🟢 PTT: {self._ptt_port_label()}")
                 self.tx_ptt_status.setStyleSheet("color: #69f0ae;")
             else:
                 self.tx_ptt_status.setText("⚫ PTT: Not connected")
@@ -8580,12 +6406,6 @@ class MainWindow(QMainWindow):
         # Sync connection status to Beacon tab
         QTimer.singleShot(1500, self._sync_beacon_connection_status)
     
-    def _auto_connect_aprs_is(self):
-        """Auto-connect to APRS-IS"""
-        if not self.aprs_is_running:
-            self._log("🚀 Auto-connecting APRS-IS...")
-            self._toggle_aprs_is_from_settings()
-
     def closeEvent(self, event):
         """Save settings when closing the application"""
         try:
@@ -8619,6 +6439,19 @@ class MainWindow(QMainWindow):
                 self.ptt_serial.close()
         except Exception as e:
             print(f"Error closing PTT: {e}")
+        try:
+            if self.civ_serial and self.civ_serial.is_open:
+                self._set_ptt(False)
+                self.civ_serial.close()
+        except Exception as e:
+            print(f"Error closing CI-V: {e}")
+        try:
+            if self.cm108_device is not None:
+                self._cm108_set_gpio(False)
+                self.cm108_device.close()
+                self.cm108_device = None
+        except Exception as e:
+            print(f"Error closing CM108: {e}")
         
         # Stop receiver if running
         try:
@@ -8680,13 +6513,15 @@ class MainWindow(QMainWindow):
         if self.map_ready:
             self.map.page().runJavaScript("refreshMap()")
             self._log("🔄 Map refreshed")
-    
-    def _switch_tiles(self, idx):
-        """Switch tile server"""
-        if self.map_ready:
-            self.map.page().runJavaScript(f"switchTiles({idx})")
-            self._log(f"🗺️ Switched to tile server {idx}")
 
+    def _on_map_layer_changed(self, index):
+        """Switch map tile layer from Qt combo"""
+        if not self.map_ready:
+            return
+        layer = self.map_layer_combo.currentData()
+        if layer:
+            self.map.page().runJavaScript(f"setMapLayer({layer!r})")
+    
     def _load_locations_menu(self):
         """Show menu to choose file or folder loading"""
         from PyQt6.QtWidgets import QMenu
@@ -8955,19 +6790,33 @@ class MainWindow(QMainWindow):
                     path_list.append((p, 0))
         
         # Check PTT
-        if not self.ptt_serial or not self.ptt_serial.is_open:
-            ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
-            if ptt_port:
-                try:
-                    self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
-                    self._set_ptt(False)
-                    self._log(f"✅ Auto-connected PTT: {ptt_port}")
-                except Exception as e:
-                    QMessageBox.warning(self, "PTT Error", f"Could not connect PTT:\n{e}")
+        if not self._ptt_is_connected():
+            method = getattr(self, 'civ_ptt_method', 'RTS/DTR')
+            if method == "CI-V CAT":
+                ptt_port = self.civ_port_combo.currentData() if hasattr(self, 'civ_port_combo') else None
+                if ptt_port:
+                    try:
+                        self._toggle_civ()
+                        self._log(f"✅ Auto-connected CI-V PTT: {ptt_port}")
+                    except Exception as e:
+                        QMessageBox.warning(self, "PTT Error", f"Could not connect CI-V PTT:\n{e}")
+                        return
+                else:
+                    QMessageBox.warning(self, "PTT Not Configured", "Configure CI-V PTT in Settings")
                     return
             else:
-                QMessageBox.warning(self, "PTT Not Configured", "Configure PTT in Settings")
-                return
+                ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
+                if ptt_port:
+                    try:
+                        self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
+                        self._set_ptt(False)
+                        self._log(f"✅ Auto-connected PTT: {ptt_port}")
+                    except Exception as e:
+                        QMessageBox.warning(self, "PTT Error", f"Could not connect PTT:\n{e}")
+                        return
+                else:
+                    QMessageBox.warning(self, "PTT Not Configured", "Configure PTT in Settings")
+                    return
         
         # Get TX audio device
         tx_device = self.settings_tx_audio_combo.currentData() if hasattr(self, 'settings_tx_audio_combo') else None
@@ -9338,6 +7187,15 @@ class MainWindow(QMainWindow):
         if now - self.dedup.get(key, 0) < 1.5:
             return
         self.dedup[key] = now
+
+        # Track this station as RF-heard (for TX IGate eligibility)
+        if hasattr(self, 'igate_rf_heard'):
+            self.igate_rf_heard[src.upper()] = now
+
+        # RX IGate: gate to APRS-IS if enabled
+        if getattr(self, 'igate_rx_enabled', False):
+            self._igate_log_entry(f"📻 RF heard: {src}>{dst} via {via}", "#64b5f6")
+            self._gate_packet_to_is(src, dst, via, info, pkt)
         
         # Track digipeater usage from RF
         if via and via != "-":
@@ -9368,7 +7226,7 @@ class MainWindow(QMainWindow):
             if is_my_packet:
                 header_color = "#69f0ae"  # Green for YOUR packets
             else:
-                header_color = "#ffd54f"  # Gold for all other packets
+                header_color = "#ff9800"  # Orange for RF packets (distinct from IS gold)
             
             # Detail line color (used for coords, comments, weather)
             detail_color = "#64b5f6"  # Light blue for all details
