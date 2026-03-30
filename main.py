@@ -12,7 +12,7 @@ Features:
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.3-beta"
+__version__ = "0.1.4-beta"
 VERSION = __version__
 
 import sys
@@ -369,6 +369,17 @@ def build_icon_cache():
             cell.save(ICON_CACHE_DIR / f"{prefix}_{a:03d}.png")
 
 
+def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return distance in meters between two lat/lon points."""
+    import math
+    R = 6_371_000  # Earth radius in meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
 def icon_path(table: str, sym: str) -> Tuple[Path, Optional[str]]:
     """
     Get the icon path for an APRS symbol.
@@ -507,9 +518,15 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     
     # First, remove non-printable and non-ASCII characters (telemetry garbage)
     text = ''.join(c for c in text if c.isprintable() and ord(c) < 128)
-    
-    # Detect binary garbage — if more than 30% of chars are non-alphanumeric/non-space
-    # it's likely a binary payload that decoded as latin-1 garbage
+
+    # Truncate at first run of garbage — 3+ consecutive non-printable-friendly chars
+    # catches mixed comments like "13.1V 75F Simi Club 2024???????`??l???"
+    import re as _re
+    garbage_match = _re.search(r'[^\w\s.,!\-_/:()@#\[\]+=\'"]{3,}', text)
+    if garbage_match:
+        text = text[:garbage_match.start()].strip()
+
+    # Whole-string garbage check — if >60% non-alphanumeric it's pure binary
     if len(text) > 8:
         alpha_count = sum(1 for c in text if c.isalnum() or c in ' .,!?-_/:()')
         if alpha_count / len(text) < 0.4:
@@ -845,6 +862,9 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
         self.gps_lon = None
         self.gps_has_fix = False
         self.gps_buffer = ""  # Buffer for NMEA sentence assembly
+        self.last_beacon_lat = None  # last position we beaconed from
+        self.last_beacon_lon = None
+        self.MIN_BEACON_DISTANCE_M = 25  # meters — don't beacon if moved less than this
         
         # APRS-IS connection
         self.aprs_is_socket = None
@@ -956,16 +976,19 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
         self.setWindowTitle(f"PyTNC Pro v{VERSION} - APRS Transceiver")
         self.setGeometry(50, 50, 1400, 850)
         
-        # Set application icon
+        # Set application icon — check all possible locations including PyInstaller bundle
         icon_paths = [
+            BUNDLE_DIR / "pytnc_pro.ico",
+            BUNDLE_DIR / "tnc" / "icon.png",
             Path(__file__).parent / "pytnc_pro.ico",
-            Path(__file__).parent / "pytnc_pro_256.png",
+            Path(__file__).parent / "tnc" / "icon.png",
             Path(sys.executable).parent / "pytnc_pro.ico",
-            Path(sys.executable).parent / "pytnc_pro_256.png",
         ]
-        for icon_path in icon_paths:
-            if icon_path.exists():
-                self.setWindowIcon(QIcon(str(icon_path)))
+        for _ip in icon_paths:
+            if _ip.exists():
+                _icon = QIcon(str(_ip))
+                self.setWindowIcon(_icon)
+                QApplication.instance().setWindowIcon(_icon)
                 break
         
         central = QWidget()
@@ -2111,8 +2134,8 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
         info_layout.addLayout(content_layout, 1)
         
         # Version info at bottom
-        version_label = QLabel(f"PyTNC Pro v{VERSION} by KO6IKR © 2026")
-        version_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
+        version_label = QLabel(f"PyTNC Pro by KO6IKR © 2026")
+        version_label.setStyleSheet("color: #607d8b; font-size: 11px;")
         version_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         info_layout.addWidget(version_label)
         
@@ -3474,6 +3497,13 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
         """Update position from GPS (called from main thread via signal)"""
         first_fix = not getattr(self, 'gps_has_fix', False)
 
+        # Check if we've moved enough to warrant a beacon update
+        if self.last_beacon_lat is not None and self.last_beacon_lon is not None:
+            dist = haversine_meters(self.last_beacon_lat, self.last_beacon_lon, lat, lon)
+            self.gps_moved_enough = dist >= self.MIN_BEACON_DISTANCE_M
+        else:
+            self.gps_moved_enough = True  # first beacon always goes
+
         # Store GPS coordinates in instance variables
         self.gps_lat = lat
         self.gps_lon = lon
@@ -4373,11 +4403,12 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
 
     def _send_beacon_aprs_is(self):
         """Send beacon via APRS-IS"""
-        self._log("🌐 Attempting APRS-IS beacon...")
-        
         if not self.aprs_is_running or not self.aprs_is_socket:
-            self._log("❌ APRS-IS not connected!")
+            if hasattr(self, 'preset_log'):
+                self.preset_log.append("⚠️ Not connected to APRS-IS — go to the MAP tab and click START IS")
             return
+
+        self._log("🌐 Attempting APRS-IS beacon...")
         
         # Get beacon data
         callsign = self.callsign_edit.text().strip().upper()
@@ -4443,9 +4474,14 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
         try:
             self.aprs_is_socket.send(packet.encode())
             self._log(f"✅ Beacon sent via APRS-IS!")
+            # Record position so distance filter works correctly
+            if self.gps_has_fix and self.gps_lat is not None:
+                self.last_beacon_lat = self.gps_lat
+                self.last_beacon_lon = self.gps_lon
             
             # Log to APRS tab TX Log (cyan color for APRS-IS)
-            self.preset_log.append(f"<br><span style='color:#00d4ff'>🌐 Transmitting APRS-IS beacon...</span>")
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.preset_log.append(f"<br><span style='color:#888'>[{ts}]</span> <span style='color:#00d4ff'>🌐 Transmitting APRS-IS beacon...</span>")
             self.preset_log.append(f"   From: <span style='color:#ffd54f'>{full_call}</span>")
             self.preset_log.append(f"   To: APPR01-0 via TCPIP*")
             self.preset_log.append(f"   Position: <span style='color:#80deea'>{pos}</span>")
@@ -4491,7 +4527,7 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
         """Enable or disable auto-beacon"""
         if state == Qt.CheckState.Checked.value:
             # Start auto-beacon
-            interval_mins = self.auto_beacon_interval.value()
+            interval_mins = max(1, self.auto_beacon_interval.value())
             self.auto_beacon_countdown = interval_mins * 60  # Convert to seconds
             self.auto_beacon_timer.start(1000)  # Tick every second
             self.auto_beacon_status.setText(f"Next beacon in: {interval_mins}:00")
@@ -4530,13 +4566,19 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
             # Time to send beacon
             self._send_auto_beacon()
             
-            # Reset countdown
-            self.auto_beacon_countdown = self.auto_beacon_interval.value() * 60
+            # Reset countdown — enforce minimum 1 minute to prevent runaway
+            interval_mins = max(1, self.auto_beacon_interval.value())
+            self.auto_beacon_countdown = interval_mins * 60
     
     def _send_auto_beacon(self):
         """Send beacon based on auto-beacon mode"""
         mode = self.auto_beacon_mode.currentData()
-        
+
+        # If GPS active, skip beacon if we haven't moved MIN_BEACON_DISTANCE_M
+        if self.gps_has_fix and not getattr(self, 'gps_moved_enough', True):
+            self._log(f"⏱️ Auto-beacon skipped — moved less than {self.MIN_BEACON_DISTANCE_M}m")
+            return
+
         self._log("⏱️ Auto-beacon triggered")
         
         if mode == "is" or mode == "both":
@@ -4630,8 +4672,8 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
     
     def _branding_label(self):
         """Create small branding label for bottom-right of tabs"""
-        label = QLabel(f"PyTNC Pro v{VERSION} by KO6IKR © 2026")
-        label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
+        label = QLabel("PyTNC Pro by KO6IKR © 2026")
+        label.setStyleSheet("color: #607d8b; font-size: 11px;")
         label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         return label
     
@@ -7299,6 +7341,10 @@ class MainWindow(PTTMixin, IGateMixin, APRSISMixin, MonitorsMixin, QMainWindow):
                 self._log(f"  Telemetry: {', '.join(telem_parts)}", detail_color)
                 return
             
+            # Skip third-party frames in live feed — valid APRS but noisy
+            if aprs["kind"] == "Other" and "[Third-party]" in aprs.get("summary", ""):
+                return
+
             self._log(f"  {aprs['kind']}: {aprs['summary']}", detail_color)
             
             # Handle RF messages addressed to us

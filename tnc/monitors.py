@@ -216,6 +216,36 @@ class MonitorsMixin:
         if self.map_ready and quake_list:
             js = f"setEarthquakesBulk({json.dumps(quake_list)})"
             self.map.page().runJavaScript(js)
+
+        # Alert for M5.0+ within 50km
+        ALERT_MAG = 5.0
+        ALERT_KM  = 50
+        import math
+
+        def _dist_km(lat1, lon1, lat2, lon2):
+            R = 6371
+            phi1, phi2 = math.radians(lat1), math.radians(lat2)
+            dp = math.radians(lat2 - lat1)
+            dl = math.radians(lon2 - lon1)
+            a = math.sin(dp/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+            return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+        center_lat, center_lon = self._get_center_location()
+        alert_quake = None
+        for q in quake_list:
+            if q["mag"] >= ALERT_MAG and q.get("isRecent"):
+                dist = _dist_km(center_lat, center_lon, q["lat"], q["lon"])
+                if dist <= ALERT_KM:
+                    if alert_quake is None or q["mag"] > alert_quake[0]:
+                        alert_quake = (q["mag"], q["tooltip"].split("<br>")[0].replace("M","M"), dist, q["color"], q["tooltip"])
+
+        if alert_quake and self.map_ready:
+            mag, place, dist, color, tooltip = alert_quake
+            place_str = place.split(" - ")[-1] if " - " in place else place
+            self.map.page().runJavaScript(
+                f"showQuakeAlert({mag}, {json.dumps(place_str)}, {dist:.1f}, {json.dumps(color)});"
+            )
+            self._log(f"🚨 ALERT: M{mag:.1f} earthquake {dist:.0f}km away — {place_str}")
         
         # Alert if there are recent quakes
         if recent_count > 0:
@@ -644,12 +674,12 @@ class MonitorsMixin:
     
     def _rx_toggle_hospitals(self, state):
         """Toggle hospitals from RX page checkbox - syncs with Settings"""
-        # Sync to settings checkbox
+        # Sync to settings checkbox without triggering its signal
         if hasattr(self, 'hospital_enabled'):
             self.hospital_enabled.blockSignals(True)
             self.hospital_enabled.setChecked(state == Qt.CheckState.Checked.value)
             self.hospital_enabled.blockSignals(False)
-        # Actually toggle the layer
+        # Actually toggle the layer (only once, here)
         self._toggle_hospital_layer(state)
     
     def _toggle_hospital_layer(self, state):
@@ -663,17 +693,17 @@ class MonitorsMixin:
             self.rx_hospital_check.blockSignals(False)
         
         if enabled:
-            self.hospital_status.setText("🔄")
-            self.hospital_status.setStyleSheet("color: #ffd54f;")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setText("🔄")
+                self.hospital_status.setStyleSheet("color: #ffd54f;")
             cache = self._load_hospital_cache()
             if cache and cache.get("hospitals"):
-                # Check if cached location is close to current location
                 cur_lat, cur_lon = self._get_center_location()
                 cached_lat = cache.get("lat", None)
                 cached_lon = cache.get("lon", None)
                 if cached_lat is not None and cached_lon is not None:
                     dist = ((cur_lat - cached_lat)**2 + (cur_lon - cached_lon)**2) ** 0.5
-                    location_changed = dist > 0.5  # ~35 miles
+                    location_changed = dist > 0.5
                 else:
                     location_changed = True
                 if location_changed:
@@ -682,12 +712,15 @@ class MonitorsMixin:
                 else:
                     self._log("🏥 Loading hospitals from offline cache...")
                     self._display_hospitals(cache["hospitals"])
+                    return  # don't fall through to fetch
             else:
                 self._log("🏥 No cached data - fetching from internet...")
-                self._fetch_hospitals()
+            self._fetch_hospitals()
         else:
-            self.hospital_status.setText("⚫")
-            self.hospital_status.setStyleSheet("color: #888;")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setText("⚫")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setStyleSheet("color: #888;")
             # Clear hospitals from map
             if self.map_ready:
                 self.map.page().runJavaScript("clearHospitals()")
@@ -731,8 +764,10 @@ class MonitorsMixin:
         self._hospital_fallback_tried = False
         
         self._log(f"🏥 Downloading hospitals within {radius_miles}mi...")
-        self.hospital_status.setText("⬇️")
-        self.hospital_status.setStyleSheet("color: #ffd54f;")
+        if hasattr(self, 'hospital_status'):
+            self.hospital_status.setText("⬇️")
+        if hasattr(self, 'hospital_status'):
+            self.hospital_status.setStyleSheet("color: #ffd54f;")
         
         # Non-blocking fetch using QThreadPool
         worker = NetworkFetchWorker(url, timeout=15)
@@ -742,6 +777,7 @@ class MonitorsMixin:
     
     def _process_hospital_data(self, data):
         """Process hospital data and update map"""
+        NetworkFetchWorker = _mg().get("NetworkFetchWorker", None)
         if "error" in data:
             # Try fallback server if not already tried
             if hasattr(self, '_hospital_fallback_url') and not getattr(self, '_hospital_fallback_tried', True):
@@ -754,8 +790,10 @@ class MonitorsMixin:
                 return
             
             self._log(f"❌ Hospital fetch failed: {data['error']}")
-            self.hospital_status.setText("🔴 Err")
-            self.hospital_status.setStyleSheet("color: #ef5350;")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setText("🔴 Err")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setStyleSheet("color: #ef5350;")
             # Try to use cached data
             cache = self._load_hospital_cache()
             if cache and cache.get("hospitals"):
@@ -767,8 +805,10 @@ class MonitorsMixin:
         
         if len(elements) == 0:
             self._log("🏥 No hospitals found in range")
-            self.hospital_status.setText("0")
-            self.hospital_status.setStyleSheet("color: #69f0ae;")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setText("0")
+            if hasattr(self, 'hospital_status'):
+                self.hospital_status.setStyleSheet("color: #69f0ae;")
             return
         
         # Parse and store hospitals
@@ -813,8 +853,10 @@ class MonitorsMixin:
         
         count = len(hospitals)
         self._log(f"🏥 Displaying {count} hospitals")
-        self.hospital_status.setText(f"🟢 {count}")
-        self.hospital_status.setStyleSheet("color: #69f0ae;")
+        if hasattr(self, 'hospital_status'):
+            self.hospital_status.setText(f"🟢 {count}")
+        if hasattr(self, 'hospital_status'):
+            self.hospital_status.setStyleSheet("color: #69f0ae;")
         
         # Build list for bulk loading (faster than Python→JS per marker)
         hospital_list = []
@@ -1282,70 +1324,79 @@ class MonitorsMixin:
                 f"Check console for more details.")
     
     def _cache_digipeaters(self):
-        """Download digipeaters from aprs.fi API"""
+        """Download digipeaters from Overpass API — non-blocking"""
         _g = _mg()
         NetworkFetchWorker = _g.get("NetworkFetchWorker", None)
-        CACHE_DIR = _g.get("CACHE_DIR", None)
-        TILE_CACHE_DIR = _g.get("TILE_CACHE_DIR", None)
-        BASE_DIR = _g.get("BASE_DIR", None)
+        if not NetworkFetchWorker:
+            self._log("❌ Digi cache: NetworkFetchWorker not available")
+            return
+
         self._log("📡 Caching digipeaters...")
-        self.cache_digi_status.setText("⬇️")
-        QApplication.processEvents()
-        
-        # Get center point
+        if hasattr(self, 'cache_digi_status'):
+            self.cache_digi_status.setText("⬇️")
+
         center_lat, center_lon = self._get_center_location()
-        
-        # Use Overpass to find APRS digipeaters (tagged in OSM)
-        radius_meters = 80000  # 50 miles
+        radius_meters = 80000  # ~50 miles
         query = f'[out:json];node["radio:aprs"="yes"](around:{radius_meters},{center_lat},{center_lon});out 50;'
-        
-        # Try multiple Overpass servers
+
         overpass_servers = [
             "https://overpass-api.de/api/interpreter",
             "https://overpass.kumi.systems/api/interpreter",
         ]
-        
+
+        url = f"{overpass_servers[0]}?data={urllib.parse.quote(query)}"
+        self._digi_fallback_url = f"{overpass_servers[1]}?data={urllib.parse.quote(query)}"
+        self._digi_fallback_tried = False
+
+        worker = NetworkFetchWorker(url, timeout=30)
+        worker.signals.finished.connect(self._process_digi_data)
+        worker.signals.error.connect(lambda e: self._process_digi_data({"error": str(e)}))
+        QThreadPool.globalInstance().start(worker)
+
+    def _process_digi_data(self, data):
+        """Process digipeater data from Overpass"""
+        _g = _mg()
+        NetworkFetchWorker = _g.get("NetworkFetchWorker", None)
+
+        if isinstance(data, dict) and "error" in data:
+            if not getattr(self, '_digi_fallback_tried', True) and hasattr(self, '_digi_fallback_url'):
+                self._digi_fallback_tried = True
+                self._log("⚠️ Primary Overpass failed, trying fallback...")
+                worker = NetworkFetchWorker(self._digi_fallback_url, timeout=30)
+                worker.signals.finished.connect(self._process_digi_data)
+                worker.signals.error.connect(lambda e: self._process_digi_data({"error": str(e)}))
+                QThreadPool.globalInstance().start(worker)
+                return
+            # Both servers failed — try existing cache
+            cache_file = self._ensure_cache_dir() / "digipeaters.json"
+            if cache_file.exists():
+                self._log("📡 Overpass unavailable — using existing digi cache")
+            else:
+                self._log(f"❌ Digi cache failed: {data['error']}")
+            self._update_cache_status()
+            return
+
         try:
-            import requests
-            import json
-            
-            data = None
-            for server in overpass_servers:
-                url = f"{server}?data={urllib.parse.quote(query)}"
-                try:
-                    resp = requests.get(url, timeout=15, headers={'User-Agent': 'PyTNC-Pro/1.0'})
-                    data = resp.json()
-                    break  # Success, stop trying
-                except Exception as e:
-                    self._log(f"⚠️ Overpass server failed: {server[:30]}... trying next")
-                    continue
-            
-            if not data:
-                raise Exception("All Overpass servers failed")
-            
+            import json as _json
+            elements = data.get("elements", []) if isinstance(data, dict) else []
             digipeaters = []
-            for elem in data.get("elements", []):
+            for elem in elements:
                 tags = elem.get("tags", {})
-                digi = {
+                digipeaters.append({
                     "lat": elem.get("lat"),
                     "lon": elem.get("lon"),
                     "call": tags.get("callsign", tags.get("name", "Unknown")),
                     "freq": tags.get("frequency", "144.390")
-                }
-                digipeaters.append(digi)
-            
-            # Save to cache
+                })
             cache_file = self._ensure_cache_dir() / "digipeaters.json"
             with open(cache_file, 'w') as f:
-                json.dump({
+                _json.dump({
                     "cached_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "digipeaters": digipeaters
                 }, f)
-            
             self._log(f"📡 Cached {len(digipeaters)} digipeaters")
         except Exception as e:
-            self._log(f"❌ Digi cache failed: {e}")
-        
+            self._log(f"❌ Digi cache processing failed: {e}")
         self._update_cache_status()
     
 

@@ -163,6 +163,11 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       0%, 100% { opacity: 1; }
       50% { opacity: 0.5; }
     }
+
+    @keyframes quake-pulse {
+      0%, 100% { transform: translateX(-50%) scale(1); }
+      50% { transform: translateX(-50%) scale(1.04); }
+    }
     
     /* Earthquake magnitude label (non-recent) */
     .eq-mag-label {
@@ -1040,6 +1045,56 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         });
         earthquakeMarkers = [];
       };
+
+      // ========== EARTHQUAKE ALERT BANNER ==========
+      var quakeAlertTimeout = null;
+
+      window.showQuakeAlert = function(mag, place, distKm, color) {
+        var existing = document.getElementById('quake-alert-banner');
+        if (existing) existing.remove();
+
+        var banner = document.createElement('div');
+        banner.id = 'quake-alert-banner';
+        banner.style.cssText = [
+          'position:fixed',
+          'top:12px',
+          'left:50%',
+          'transform:translateX(-50%)',
+          'z-index:99999',
+          'background:' + (color || '#cc2200'),
+          'color:#fff',
+          'font-family:Consolas,monospace',
+          'font-size:15px',
+          'font-weight:bold',
+          'padding:10px 22px',
+          'border-radius:8px',
+          'box-shadow:0 4px 18px rgba(0,0,0,0.7)',
+          'cursor:pointer',
+          'white-space:nowrap',
+          'border:2px solid rgba(255,255,255,0.3)',
+          'animation:quake-pulse 1s ease-in-out 3'
+        ].join(';');
+
+        var emoji = mag >= 6.0 ? '🚨' : '⚠️';
+        banner.innerHTML = emoji + ' M' + mag.toFixed(1) + ' Earthquake — ' + place +
+                           ' (' + Math.round(distKm) + 'km away)' +
+                           ' <span style="font-size:11px;opacity:0.8;font-weight:normal">click to dismiss</span>';
+
+        banner.onclick = function() { banner.remove(); };
+        document.body.appendChild(banner);
+
+        // Auto-dismiss after 30 seconds
+        if (quakeAlertTimeout) clearTimeout(quakeAlertTimeout);
+        quakeAlertTimeout = setTimeout(function() {
+          if (banner.parentNode) banner.remove();
+        }, 30000);
+      };
+
+      window.clearQuakeAlert = function() {
+        var b = document.getElementById('quake-alert-banner');
+        if (b) b.remove();
+      };
+
       
       // Fire/hotspot markers (NASA FIRMS)
       var fireMarkers = [];
