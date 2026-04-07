@@ -641,6 +641,22 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           markers[call].openPopup();
         }
       };
+
+      // Remove a killed object/item from the map
+      window.removeStation = function(call) {
+        if (markers[call]) {
+          map.removeLayer(markers[call]);
+          delete markers[call];
+        }
+        if (callsignLabels[call]) {
+          map.removeLayer(callsignLabels[call]);
+          delete callsignLabels[call];
+        }
+        if (stationTrails[call]) {
+          stationTrails[call].forEach(function(seg) { map.removeLayer(seg); });
+          delete stationTrails[call];
+        }
+      };
       
       // ========== RENDER QUEUE ==========
       // Latest-wins queue keyed by callsign - coalesces rapid updates
@@ -778,7 +794,7 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         
         // Update station trail - based on SPEED not SSID
         // Extract speed from tooltip (e.g., "🚗 48 mph @ 180°" or "48 mph")
-        var speedMatch = tooltip ? tooltip.match(/(\d+(?:\.\d+)?)\s*mph/i) : null;
+        var speedMatch = tooltip ? tooltip.match(/(\\d+(?:\\.\\d+)?)\\s*mph/i) : null;
         var speed = speedMatch ? parseFloat(speedMatch[1]) : 0;
         
         // Trail if moving > 1.5 mph
