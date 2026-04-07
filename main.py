@@ -541,6 +541,17 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     # Remove OpenTracker version strings: V###OTW#
     text = re.sub(r'V\d+OTW\d*', '', text)
 
+    # Remove repeater/gateway specific tokens
+    text = re.sub(r'\bToff\b', '', text)          # non-standard tone indicator
+    text = re.sub(r'\bR\d+[km]\b', '', text)       # range indicator R09k, R30m etc.
+    text = re.sub(r'\bHDOP\d+\.\d+\b', '', text)  # GPS precision HDOP00.6
+    text = re.sub(r'\bSATS\d+\b', '', text)        # GPS satellites SATS08
+
+    # Remove Davis weather station suffix BEFORE weather token strip
+    # Must be first — weather regex b[\d.]{4,6} greedily eats the leading dot
+    # leaving DsVP without its dot and bypassing the strip below
+    text = re.sub(r'\.?Ds[A-Za-z]{2,3}', '', text)
+
     # Remove positionless weather format
     text = re.sub(r'^_\d{8}' + weather_tokens + r'+\.?', '', text)
 
@@ -552,9 +563,6 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     text = re.sub(weather_tokens + r'{2,}', '', text)
     text = re.sub(r'^' + weather_tokens + r'+', '', text)
     text = re.sub(r'(?<!\w)' + weather_tokens + r'(?!\w)', '', text)
-
-    # Remove Davis weather station suffix
-    text = re.sub(r'\.Ds[A-Z]{2,3}', '', text)
 
     # Clean up leading dots/slashes/underscores
     text = re.sub(r'^[./_]+', '', text)
@@ -4683,6 +4691,9 @@ class MainWindow(QMainWindow):
             lon = fields.get("lon")
             
             if lat is not None and lon is not None:
+                # Filter null GPS — 0,0 means no fix
+                if lat == 0.0 and lon == 0.0:
+                    return
                 sym_table = fields.get("table", "/")
                 sym_code = fields.get("sym", ">")
                 
@@ -8188,7 +8199,7 @@ class MainWindow(QMainWindow):
                     dir_names = ['omni', '45° NE', '90° E', '135° SE', '180° S', '225° SW', '270° W', '315° NW', '360° N']
                     directivity = dir_names[d] if d < len(dir_names) else 'omni'
                     phg_info = f"{power_watts}W, {height_ft}ft HAAT, {gain_dbi}dBi {directivity}"
-                    comment = re.sub(r'PHG\d{4}/?', '', comment).strip()
+                    comment = re.sub(r'PHG[\d/]{4,5}/?', '', comment).strip()
 
                 # Voice frequency — spec: FFF.FFFMHz but real-world has variable decimals
                 # Also matches: 445.02500MHz, 145.450, 1288.450 -12MHz
@@ -8215,7 +8226,10 @@ class MainWindow(QMainWindow):
             
             # If we got a valid position, add to map
             if lat is not None and lon is not None:
-                # Get icon
+                # Filter null GPS — 0,0 means no fix (common Anytone APAT81 issue)
+                if lat == 0.0 and lon == 0.0:
+                    self._log("   ⚠️ Null GPS (0,0) — position not plotted", "#546e7a")
+                    return
                 ic, ov = icon_path(sym_table, sym_code)
                 if ov:
                     ic = make_overlay(ic, ov)
@@ -8263,12 +8277,18 @@ class MainWindow(QMainWindow):
                 if freq_info:
                     tooltip_parts.append(freq_info)
                 
-                # Speed and course
-                if speed_mph is not None and speed_mph > 0:
-                    speed_str = f"🚗 {speed_mph:.0f} mph"
-                    if course is not None:
-                        speed_str += f" @ {course}°"
-                    tooltip_parts.append(speed_str)
+                # Speed and course — show course even when stationary
+                if speed_mph is not None:
+                    if speed_mph > 0:
+                        speed_str = f"🚗 {speed_mph:.0f} mph"
+                        if course is not None and course > 0:
+                            speed_str += f" @ {course}°"
+                    elif course is not None and course > 0:
+                        speed_str = f"⬆️ {course}°"
+                    else:
+                        speed_str = None
+                    if speed_str:
+                        tooltip_parts.append(speed_str)
                 
                 # Altitude
                 if altitude_ft is not None:
@@ -10185,11 +10205,13 @@ class MainWindow(QMainWindow):
             detail_color = "#64b5f6"
 
             # Log header (skip for third-party — already logged in unwrap block above)
+            # Deferred: built here but logged after null GPS check below
             if not is_third_party:
                 header = f"📻 <a href='aprs://pan/{src_for_parse}' style='color:{header_color};text-decoration:none;font-weight:bold'>{src_for_parse}</a><span style='color:{header_color}'>&gt;{dst_for_parse} via {via}</span>"
                 if device:
                     header += f" <span style='color:{header_color}'>[{device}]</span>"
-                self._log(header)
+            else:
+                header = None
             
             # Handle telemetry definitions - store them
             if aprs["kind"] in ("Telem-PARM", "Telem-UNIT", "Telem-EQNS", "Telem-BITS"):
@@ -10252,7 +10274,25 @@ class MainWindow(QMainWindow):
                 self._log(f"  Telemetry: {', '.join(telem_parts)}", detail_color)
                 return
             
-            self._log(f"  {aprs['kind']}: {aprs['summary']}", detail_color)
+            # Header is safe to log now
+            if header:
+                self._log(header)
+
+            # Pre-check: suppress null GPS (0,0) position — don't log or plot
+            # Anytone APAT81 sends 0,0 continuously when no GPS fix
+            # Still show header above so the station is visible as RF-active
+            if aprs["kind"] in ("Position", "Position+Time", "Mic-E", "NMEA"):
+                try:
+                    _f = aprs["fields"]
+                    if "lat" in _f and "lon" in _f:
+                        if float(_f["lat"]) == 0.0 and float(_f["lon"]) == 0.0:
+                            self._log("  ⚠️ No GPS fix", "#546e7a")
+                            return
+                except Exception:
+                    pass
+
+            summary = re.sub(r'![Ww].{2}!', '', aprs['summary']).strip()
+            self._log(f"  {aprs['kind']}: {summary}", detail_color)
             
             # Handle RF messages addressed to us
             if aprs["kind"] in ("Message", "Message-ACK", "Message-REJ"):
@@ -10294,6 +10334,11 @@ class MainWindow(QMainWindow):
                     lat, lon = float(f["lat"]), float(f["lon"])
                 except Exception as e:
                     self._log(f"  ERROR parsing coords: {e}")
+                    return
+
+                # Filter null GPS (0,0) — Anytone APAT81 sends this when no fix
+                # Suppress entirely — don't log, don't plot
+                if lat == 0.0 and lon == 0.0:
                     return
                 
                 # Extra info display based on packet type
@@ -10369,14 +10414,16 @@ class MainWindow(QMainWindow):
                     if f.get("radio_type") and f.get("radio_type") != device:
                         tooltip_parts.append(f"📻 {f['radio_type']}")
                 
-                # Speed/course - check for any packet type
+                # Speed/course - show course even when stationary
                 speed_mph = f.get("speed_mph") or 0
+                course = f.get("course") or 0
                 if speed_mph > 0:
                     speed_str = f"🚗 {speed_mph:.0f} mph"
-                    course = f.get("course") or 0
                     if course > 0:
                         speed_str += f" @ {course:.0f}°"
                     tooltip_parts.append(speed_str)
+                elif course > 0:
+                    tooltip_parts.append(f"⬆️ {course:.0f}°")
                 
                 # Altitude - check for any packet type
                 altitude_ft = f.get("altitude_ft")
