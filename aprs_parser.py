@@ -593,22 +593,40 @@ def aprs_classify(dest: str, info: str) -> Dict[str, Any]:
         return {"kind": "Status", "summary": s[1:].strip(), "fields": {}}
 
     # Telemetry packet: T#seq,A1,A2,A3,A4,A5,DDDDDDDD
+    # Original spec: 3-digit integer 000-255. Real world: variable width,
+    # optional leading minus, optional decimal point. All modern apps accept this.
     if s.startswith("T#"):
         try:
             parts = s[2:].split(",")
             if len(parts) >= 6:
-                seq = int(parts[0])
-                analogs = [int(parts[i]) if parts[i].isdigit() else 0 for i in range(1, 6)]
-                
+                # Sequence may be alphanumeric in newer implementations
+                seq_str = parts[0].strip()
+                try:
+                    seq = int(seq_str)
+                except ValueError:
+                    seq = 0  # Non-numeric sequence, keep raw
+
+                # Parse analog values — accept int, float, negative, empty
+                analogs = []
+                for i in range(1, 6):
+                    raw = parts[i].strip() if i < len(parts) else "0"
+                    try:
+                        val = float(raw)
+                        # Display as int if whole number, else float
+                        analogs.append(int(val) if val == int(val) else val)
+                    except ValueError:
+                        analogs.append(0)
+
                 # Digital bits (8 bits as string of 0/1)
                 digitals = []
                 if len(parts) >= 7 and len(parts[6]) >= 8:
                     for i in range(8):
                         digitals.append(int(parts[6][i]) if parts[6][i] in '01' else 0)
-                
-                summary = f"Seq={seq}, A1={analogs[0]}, A2={analogs[1]}, A3={analogs[2]}, A4={analogs[3]}, A5={analogs[4]}"
+
+                summary = f"Seq={seq_str}, " + ", ".join(f"A{i+1}={v}" for i, v in enumerate(analogs))
                 if digitals:
-                    summary += f", D={parts[6][:8]}"
+                    for i, bit in enumerate(digitals):
+                        summary += f", D{i+1}={bit}"
                 
                 return {
                     "kind": "Telemetry",
@@ -828,16 +846,19 @@ def aprs_classify(dest: str, info: str) -> Dict[str, Any]:
                 # Remove from comment
                 comment = comment.replace(freq_match.group(0), "")
             
-            # Altitude: /A=xxxxxx (exactly 6 digits per APRS spec)
-            alt_match = re.search(r'/A=(-?\d{6})', rest)
+            # Altitude: /A=xxxxxx (6 positive digits) or /A=-xxxxx (minus + 5 digits)
+            # Per WB2OSZ: "The MIC-E format allows a negative altitude but the /A= format
+            # does not allow that." — then notes /A=-12345 is widely recognized in practice.
+            # Total field is always 6 chars: 6 digits or minus + 5 digits.
+            alt_match = re.search(r'/A=(-\d{5}|\d{6})', rest)
             if alt_match:
                 altitude_ft = int(alt_match.group(1))
                 altitude_m = int(altitude_ft * 0.3048)
                 # Remove altitude from comment (don't require word boundary)
-                comment = re.sub(r'/A=-?\d{6}', '', comment)
+                comment = re.sub(r'/A=(?:-\d{5}|\d{6})', '', comment)
             
-            # Also remove altitude without leading slash (might be partially stripped elsewhere)
-            comment = re.sub(r'(?<![a-zA-Z])A=-?\d{6}', '', comment)
+            # Also remove altitude without leading slash
+            comment = re.sub(r'(?<![a-zA-Z])A=(?:-\d{5}|\d{6})', '', comment)
             
             # Clean up comment - remove weather tokens for display
             # Weather tokens pattern

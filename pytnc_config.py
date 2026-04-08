@@ -323,6 +323,66 @@ MICE_LEGACY = {
 }
 
 
+
+# =============================================================================
+# Runtime TOCALL loader from aprsorg/aprs-deviceid
+# =============================================================================
+
+import json, threading, urllib.request, time as _time
+
+_TOCALL_CACHE_FILE = USER_DATA_DIR / "aprs_deviceid_cache.json"
+_TOCALL_CACHE_AGE  = 7 * 24 * 3600   # Re-fetch weekly
+_TOCALL_URL = "https://raw.githubusercontent.com/aprsorg/aprs-deviceid/main/tocalls.pretty.json"
+
+def _load_tocall_from_cache() -> bool:
+    """Load tocall overrides from local cache. Returns True if cache is fresh."""
+    try:
+        if not _TOCALL_CACHE_FILE.exists():
+            return False
+        age = _time.time() - _TOCALL_CACHE_FILE.stat().st_mtime
+        if age > _TOCALL_CACHE_AGE:
+            return False
+        with open(_TOCALL_CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        _apply_tocall_data(data)
+        return True
+    except Exception:
+        return False
+
+def _apply_tocall_data(data: dict):
+    """Apply fetched tocall data into TOCALL_DEVICES, longest keys first."""
+    tocalls = data.get("tocalls", {})
+    for tocall, info in tocalls.items():
+        # Skip wildcards (contain n or x — variable digits/chars)
+        if "n" in tocall.lower() or tocall.endswith("x") or tocall.endswith("X"):
+            continue
+        model = info.get("model") or info.get("vendor") or ""
+        vendor = info.get("vendor") or ""
+        desc = f"{vendor} {model}".strip() if vendor and model else model or vendor
+        if desc and tocall not in TOCALL_DEVICES:
+            TOCALL_DEVICES[tocall] = desc
+
+def _fetch_tocall_background():
+    """Fetch latest tocall list from GitHub in background thread."""
+    try:
+        req = urllib.request.Request(
+            _TOCALL_URL,
+            headers={"User-Agent": f"PyTNC-Pro/{__import__('pytnc_config', fromlist=[]).get('VERSION', '0.1')}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        _apply_tocall_data(data)
+        with open(_TOCALL_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # Network unavailable — use built-in table
+
+def init_tocall_db():
+    """Called at startup: load cache, then refresh in background if stale."""
+    if not _load_tocall_from_cache():
+        t = threading.Thread(target=_fetch_tocall_background, daemon=True)
+        t.start()
+
 def get_device_from_tocall(tocall: str) -> Optional[str]:
     """Look up device type from destination callsign."""
     tocall = tocall.upper().split("-")[0]

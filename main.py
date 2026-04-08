@@ -72,9 +72,12 @@ from pytnc_config import (
     BASE_DIR, CACHE_DIR, ICON_CACHE_DIR, HESSU_SYMBOLS_DIR, LEAFLET_JS_PATH, LEAFLET_CSS_PATH,
     SETTINGS_FILE, LUT_FILENAME,
     SAMPLE_RATE, TX_SAMPLE_RATE, HTTP_PORT,
-    TOCALL_DEVICES, get_device_from_tocall,
+    TOCALL_DEVICES, get_device_from_tocall, init_tocall_db,
     MIC_E_RADIOS, MIC_E_MSG_TYPES, MIC_E_DEST_TABLE, SSID_TYPES, TILE_CACHE_DIR, USER_DATA_DIR, BUNDLE_DIR
 )
+
+# Fetch latest APRS device ID list from aprsorg/aprs-deviceid (background, weekly)
+init_tocall_db()
 
 
 # =============================================================================
@@ -510,8 +513,11 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     # These are binary-encoded sensor values, not human-readable text
     text = re.sub(r'\|[!-{]{2,12}\|', ' ', text)
 
-    # Strip DAO precision extension — !W..! or !w..! (case-insensitive, §3.5 WB2OSZ)
-    text = re.sub(r'![Ww].{2}!', '', text)
+    # Strip PHG (Power/Height/Gain) extension — PHG#### or PHG5/60/ slash variants
+    text = re.sub(r'PHG[\d/]{4,5}/?', '', text).strip()
+
+    # Strip altitude extension /A=xxxxxx anywhere in comment
+    text = re.sub(r'/?A=-?\d{5,6}', '', text).strip()
     text = re.sub(r'!DAO!', '', text)
 
     # Strip !x! no-archive flag — spec says literal lowercase x
@@ -580,6 +586,9 @@ def clean_aprs_comment(text: str, max_len: int = 120) -> str:
     # Truncate
     if len(text) > max_len:
         text = text[:max_len]
+
+    # Strip lone trailing Mic-E device prefix chars
+    text = text.rstrip("`'").strip()
 
     return text
 
@@ -779,10 +788,13 @@ class LogPage(QWebEnginePage):
     def _handle_new_window_url(self, url):
         """Open the URL from target=_blank in system browser"""
         url_str = url.toString()
-        if url_str and url_str != 'about:blank':
+        # Ignore about: URLs — Chromium uses about:blank#blocked for blocked navigations
+        if not url_str or url_str.startswith('about:'):
+            return
+        if url_str.startswith('http://') or url_str.startswith('https://'):
             import webbrowser
             webbrowser.open(url_str)
-            self.log(f"🌐 Opening: {url_str}")
+            self.log(f"Opening: {url_str}")
     
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         """Handle link clicks - open external URLs in system browser"""
@@ -791,10 +803,8 @@ class LogPage(QWebEnginePage):
         # If it's an external URL (not our local server), open in browser
         if url_str.startswith('https://') or url_str.startswith('http://'):
             if '127.0.0.1' not in url_str and 'localhost' not in url_str:
-                # External link - open in system browser
                 import webbrowser
                 webbrowser.open(url_str)
-                self.log(f"🌐 Opening: {url_str}")
                 return False  # Don't navigate in the WebView
         
         # Allow local navigation
@@ -858,7 +868,15 @@ class MainWindow(QMainWindow):
         self.gps_lat = None
         self.gps_lon = None
         self.gps_has_fix = False
+        self.gps_speed_mph = 0.0
+        self.gps_course = 0.0
         self.gps_buffer = ""  # Buffer for NMEA sentence assembly
+
+        # SmartBeaconing state
+        self.sb_last_beacon_lat = None
+        self.sb_last_beacon_lon = None
+        self.sb_last_beacon_course = 0.0
+        self.sb_last_beacon_time = 0.0
         
         # APRS-IS connection
         self.aprs_is_socket = None
@@ -1731,7 +1749,7 @@ class MainWindow(QMainWindow):
         self.save_settings_btn = QPushButton("💾 Save")
         self.save_settings_btn.setFixedWidth(80)
         self.save_settings_btn.setMinimumHeight(28)
-        self.save_settings_btn.clicked.connect(self.save_settings)
+        self.save_settings_btn.clicked.connect(self._save_from_aprs_btn)
         self.save_settings_btn.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -1838,7 +1856,17 @@ class MainWindow(QMainWindow):
         self.auto_beacon_status = QLabel("Auto-beacon: Off")
         self.auto_beacon_status.setStyleSheet("color: #607d8b;")
         auto_layout.addWidget(self.auto_beacon_status, 3, 0, 1, 2)
-        
+
+        # SmartBeaconing
+        self.smart_beacon_enabled = QCheckBox("SmartBeaconing™ (GPS)")
+        self.smart_beacon_enabled.setToolTip(
+            "Automatically adjust beacon rate based on speed and direction change.\n"
+            "Fast when moving quickly or turning, slow when stationary.\n"
+            "Requires GPS fix."
+        )
+        self.smart_beacon_enabled.setStyleSheet("color: #80deea;")
+        auto_layout.addWidget(self.smart_beacon_enabled, 4, 0, 1, 2)
+
         left_layout.addWidget(auto_beacon_grp)
         
         # Initialize auto-beacon timer
@@ -4090,6 +4118,7 @@ class MainWindow(QMainWindow):
     
     def _update_gps_status(self, has_fix: bool, speed_mph: float = 0):
         """Update GPS status display"""
+        self.gps_speed_mph = speed_mph  # Store for SmartBeaconing
         if has_fix:
             if hasattr(self, 'tx_gps_status'):
                 if speed_mph > 0:
@@ -5143,20 +5172,88 @@ class MainWindow(QMainWindow):
             self._log(f"⏱️ Auto-beacon interval changed to {value} minutes")
     
     def _auto_beacon_tick(self):
-        """Called every second when auto-beacon is enabled"""
-        self.auto_beacon_countdown -= 1
-        
-        # Update countdown display
-        mins = self.auto_beacon_countdown // 60
-        secs = self.auto_beacon_countdown % 60
-        self.auto_beacon_status.setText(f"Next beacon in: {mins}:{secs:02d}")
-        
-        if self.auto_beacon_countdown <= 0:
-            # Time to send beacon
-            self._send_auto_beacon()
-            
-            # Reset countdown
-            self.auto_beacon_countdown = self.auto_beacon_interval.value() * 60
+        """Called every second — handles both fixed-interval and SmartBeaconing."""
+        import math, time as _time
+
+        smart = hasattr(self, 'smart_beacon_enabled') and self.smart_beacon_enabled.isChecked()
+        has_gps = self.gps_has_fix and self.gps_lat is not None
+
+        if smart and has_gps:
+            # ── SmartBeaconing algorithm (standard APRS SmartBeaconing™) ──────
+            # Parameters (could be user-configurable later)
+            FAST_SPEED_MPH  = 60    # above this → fast rate
+            SLOW_SPEED_MPH  = 5     # below this → slow rate
+            FAST_RATE_SECS  = 30    # beacon every N sec when fast
+            SLOW_RATE_SECS  = 1800  # beacon every N sec when slow (30 min)
+            MIN_TURN_DEGS   = 15    # minimum course change to trigger beacon
+            TURN_SLOPE      = 255   # higher = more sensitive to slow turns
+            MIN_BEACON_SECS = 30    # never beacon more often than this
+            MIN_MOVE_METERS = 25    # don't beacon if barely moved
+
+            speed = self.gps_speed_mph
+            now   = _time.time()
+            elapsed = now - self.sb_last_beacon_time
+
+            # Rate based on speed
+            if speed >= FAST_SPEED_MPH:
+                rate = FAST_RATE_SECS
+            elif speed <= SLOW_SPEED_MPH:
+                rate = SLOW_RATE_SECS
+            else:
+                # Linear interpolation between slow and fast
+                frac = (speed - SLOW_SPEED_MPH) / (FAST_SPEED_MPH - SLOW_SPEED_MPH)
+                rate = int(SLOW_RATE_SECS - frac * (SLOW_RATE_SECS - FAST_RATE_SECS))
+
+            # Turn detection — only when moving above slow threshold
+            turn_beacon = False
+            if speed > SLOW_SPEED_MPH and self.sb_last_beacon_course is not None:
+                turn_threshold = max(MIN_TURN_DEGS, TURN_SLOPE / max(speed, 1))
+                course_diff = abs(self.gps_course - self.sb_last_beacon_course)
+                if course_diff > 180:
+                    course_diff = 360 - course_diff
+                if course_diff >= turn_threshold and elapsed >= MIN_BEACON_SECS:
+                    turn_beacon = True
+
+            # Distance check
+            moved_enough = True
+            if self.sb_last_beacon_lat is not None:
+                def _hav(la1, lo1, la2, lo2):
+                    R = 6371000
+                    p1, p2 = math.radians(la1), math.radians(la2)
+                    dp = math.radians(la2-la1); dl = math.radians(lo2-lo1)
+                    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+                    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+                dist = _hav(self.sb_last_beacon_lat, self.sb_last_beacon_lon,
+                            self.gps_lat, self.gps_lon)
+                moved_enough = dist >= MIN_MOVE_METERS
+
+            should_beacon = (elapsed >= rate and moved_enough) or turn_beacon
+
+            # Update countdown display
+            remaining = max(0, int(rate - elapsed))
+            mins, secs = remaining // 60, remaining % 60
+            reason = "🔄 turn" if turn_beacon else f"⏱️ {mins}:{secs:02d}"
+            self.auto_beacon_status.setText(f"SmartBeacon: {speed:.0f}mph — {reason}")
+
+            if should_beacon:
+                self._send_auto_beacon()
+                self.sb_last_beacon_lat   = self.gps_lat
+                self.sb_last_beacon_lon   = self.gps_lon
+                self.sb_last_beacon_course = self.gps_course
+                self.sb_last_beacon_time  = now
+
+        else:
+            # ── Fixed interval mode ───────────────────────────────────────────
+            self.auto_beacon_countdown -= 1
+            mins = self.auto_beacon_countdown // 60
+            secs = self.auto_beacon_countdown % 60
+            label = "SmartBeacon: no GPS" if smart else f"Next beacon: {mins}:{secs:02d}"
+            self.auto_beacon_status.setText(label)
+
+            if self.auto_beacon_countdown <= 0:
+                self._send_auto_beacon()
+                interval_mins = max(1, self.auto_beacon_interval.value())
+                self.auto_beacon_countdown = interval_mins * 60
     
     def _send_auto_beacon(self):
         """Send beacon based on auto-beacon mode"""
@@ -5179,6 +5276,12 @@ class MainWindow(QMainWindow):
         """Save settings from the settings tab"""
         self.save_settings()
         self._log("✓ Settings saved", "#69f0ae")
+        if hasattr(self, 'save_settings_btn'):
+            self._flash_save_btn(self.save_settings_btn)
+        # Flash the settings tab save button too if it exists
+        sender = self.sender()
+        if sender and sender is not getattr(self, 'save_settings_btn', None):
+            self._flash_save_btn(sender)
     
     def _sync_callsign_to_beacon(self, text):
         """Sync callsign from Settings to Beacon Settings"""
@@ -5269,8 +5372,22 @@ class MainWindow(QMainWindow):
         self.msg_history.clear()
         if not self.current_conv or self.current_conv not in self.conversations:
             return
-        
+
         my_call = f"{self.callsign_edit.text().strip().upper()}-{self.ssid_combo.currentData()}"
+
+        # Mark all incoming messages in this conversation as read
+        for msg in self.conversations[self.current_conv]:
+            if msg.get("from") != my_call:
+                msg["read"] = True
+
+        # Clear tab badge if no other unread conversations
+        total_unread = sum(
+            1 for msgs in self.conversations.values()
+            for m in msgs
+            if m.get("from") != my_call and not m.get("read")
+        )
+        if total_unread == 0:
+            self.tabs.setTabText(2, "💬 Messages")
         
         html = ""
         for msg in self.conversations[self.current_conv]:
@@ -5302,23 +5419,46 @@ class MainWindow(QMainWindow):
         """Update the conversations list widget"""
         self.conv_list.clear()
         my_call = f"{self.callsign_edit.text().strip().upper()}-{self.ssid_combo.currentData()}"
-        
-        for callsign, messages in self.conversations.items():
-            if messages:
-                last_msg = messages[-1]
-                preview = last_msg.get("text", "")[:20]
-                if len(last_msg.get("text", "")) > 20:
-                    preview += "..."
-                
-                item = QListWidgetItem(f"{callsign}\n{preview}")
-                item.setData(Qt.ItemDataRole.UserRole, callsign)
-                
-                # Check for unacked outgoing messages
-                has_unacked = any(not m.get("acked") and m.get("from") == my_call for m in messages)
-                if has_unacked:
-                    item.setForeground(QColor("#ffb74d"))  # Orange for pending
-                
-                self.conv_list.addItem(item)
+
+        for callsign, messages in sorted(
+            self.conversations.items(),
+            key=lambda kv: kv[1][-1].get("time", "") if kv[1] else "",
+            reverse=True
+        ):
+            if not messages:
+                continue
+
+            last_msg = messages[-1]
+            preview = last_msg.get("text", "")[:25]
+            if len(last_msg.get("text", "")) > 25:
+                preview += "\u2026"
+            time_str = last_msg.get("time", "")
+
+            # Count unread incoming
+            unread = sum(
+                1 for m in messages
+                if m.get("from") != my_call and not m.get("read")
+            )
+            has_unacked = any(
+                not m.get("acked") and m.get("from") == my_call
+                for m in messages
+            )
+
+            badge    = f" \U0001f534{unread}" if unread > 0 else ""
+            ack_warn = " \u23f3" if has_unacked else ""
+            display  = f"{callsign}{badge}{ack_warn}\n{time_str}  {preview}"
+
+            item = QListWidgetItem(display)
+            item.setData(Qt.ItemDataRole.UserRole, callsign)
+
+            if unread > 0:
+                item.setForeground(QColor("#69f0ae"))
+            elif has_unacked:
+                item.setForeground(QColor("#ffb74d"))
+            else:
+                item.setForeground(QColor("#b0bec5"))
+
+            self.conv_list.addItem(item)
     
     def _save_conversations(self):
         """Save conversations to JSON file"""
@@ -6073,6 +6213,8 @@ class MainWindow(QMainWindow):
     def _vara_save_settings(self):
         """Save all settings (VARA FM tab uses same global save)"""
         self.save_settings()
+        if hasattr(self, 'vara_save_btn'):
+            self._flash_save_btn(self.vara_save_btn)
 
     def _vara_build_symbol_grid(self):
         """Build the symbol picker grid for VARA FM tab"""
@@ -8206,7 +8348,7 @@ class MainWindow(QMainWindow):
                 freq_match = re.search(r'(\d{2,4}\.\d{2,5})\s*(?:MHz)?(?:\s+[TC](\d{3}))?(?:\s+([+-]\d{3,4}))?', comment)
                 if freq_match:
                     freq_mhz = float(freq_match.group(1))
-                    # Sanity check — APRS voice freqs are 144-450MHz range typically
+                    # Sanity check — APRS voice freqs are 144-1300MHz range
                     if 100 <= freq_mhz <= 1300:
                         tone = freq_match.group(2)
                         offset = freq_match.group(3)
@@ -8216,6 +8358,10 @@ class MainWindow(QMainWindow):
                         if offset:
                             offset_khz = int(offset) * 10
                             freq_info += f" {'+' if offset_khz > 0 else ''}{offset_khz}kHz"
+                        # Strip frequency from comment so it doesn't show twice
+                        # Also strip band label prefix like "440 Voice", "2m Voice", "1.2 Voice"
+                        comment = comment[:freq_match.start()].strip()
+                        comment = re.sub(r'\b(?:\d+(?:\.\d+)?[cm]?m\s+)?(?:Voice|Data)\s*$', '', comment, flags=re.IGNORECASE).strip()
             
             # Parse grid square (Maidenhead locator)
             grid_square = None
@@ -8359,7 +8505,12 @@ class MainWindow(QMainWindow):
                 import json
                 call_js = json.dumps(callsign)
                 tooltip_js = json.dumps(tooltip)
-                via_js = json.dumps(via if via else "")
+                # Clean via path for display — strip internet routing tokens
+                via_clean = ", ".join(
+                    p.rstrip("*") for p in (via or "").split(",")
+                    if p.strip() and not p.strip().startswith(("qA", "TCPIP", "TCPXX"))
+                ) or ""
+                via_js = json.dumps(via_clean)
                 is_digi_js = "true" if is_digi else "false"
                 
                 js = f"queueStation({call_js},{lat},{lon},'{icon_url}',{tooltip_js},{is_digi_js},{via_js})"
@@ -8871,6 +9022,21 @@ class MainWindow(QMainWindow):
         else:
             self.tx_audio_status.setText("⚫ TX Audio: Not set")
             self.tx_audio_status.setStyleSheet("color: #607d8b;")
+
+    def _save_from_aprs_btn(self):
+        """Save settings from APRS tab Save button with flash feedback"""
+        self.save_settings()
+        if hasattr(self, 'save_settings_btn'):
+            self._flash_save_btn(self.save_settings_btn)
+
+    def _flash_save_btn(self, btn):
+        """Flash a save button green with ✅ Saved! text for 1.5 seconds"""
+        from PyQt6.QtCore import QTimer
+        orig_text = btn.text()
+        orig_style = btn.styleSheet()
+        btn.setText("✅ Saved!")
+        btn.setStyleSheet(orig_style + "background: #2e7d32; color: #fff;")
+        QTimer.singleShot(1500, lambda: (btn.setText(orig_text), btn.setStyleSheet(orig_style)))
 
     def save_settings(self):
         """Save user settings to JSON file"""
@@ -10292,6 +10458,13 @@ class MainWindow(QMainWindow):
                     pass
 
             summary = re.sub(r'![Ww].{2}!', '', aprs['summary']).strip()
+            # Strip trailing Mic-E device identifier chars
+            summary = summary.rstrip("`'")
+            # Strip Mic-E symbol description — redundant with map icon
+            # "normal car (side view), Byonics TinyTrak3, [In Service] N 34..."
+            #  → "Byonics TinyTrak3, [In Service] N 34..."
+            if aprs["kind"] == "Mic-E":
+                summary = re.sub(r'^[^,]+,\s*', '', summary)
             self._log(f"  {aprs['kind']}: {summary}", detail_color)
             
             # Handle RF messages addressed to us
@@ -10490,7 +10663,12 @@ class MainWindow(QMainWindow):
                 import json
                 src_js = json.dumps(src)
                 tooltip_js = json.dumps(tooltip)
-                via_js = json.dumps(via if via else "")
+                # Clean via — strip qA* internet routing tokens for display
+                via_clean = ", ".join(
+                    p.rstrip("*") for p in (via or "").split(",")
+                    if p.strip() and not p.strip().startswith(("qA", "TCPIP", "TCPXX"))
+                ) or ""
+                via_js = json.dumps(via_clean)
                 is_digi_js = "true" if is_digi else "false"
                 
                 js = f"queueStation({src_js},{lat},{lon},'{icon_url}',{tooltip_js},{is_digi_js},{via_js})"

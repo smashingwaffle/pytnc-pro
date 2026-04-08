@@ -600,6 +600,35 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
 
       // Run pruning every 5 minutes
       setInterval(pruneOldMarkers, 5 * 60 * 1000);
+
+      // Station age fading — run every 60 seconds
+      // Fresh (<30min): full opacity | Aging (30min-2h): fade to 40% | Old (>2h): 25%
+      function updateStationAge() {
+        var now = Date.now();
+        var FRESH_MS = 30  * 60 * 1000;   // 30 min
+        var AGING_MS = 120 * 60 * 1000;   // 2 hours
+        Object.keys(markers).forEach(function(call) {
+          var age = now - (markers[call]._lastUpdate || now);
+          var opacity;
+          if (age < FRESH_MS) {
+            opacity = 1.0;
+          } else if (age < AGING_MS) {
+            var frac = (age - FRESH_MS) / (AGING_MS - FRESH_MS);
+            opacity = 1.0 - frac * 0.6;
+          } else {
+            opacity = 0.25;
+          }
+          // Fade the marker icon
+          markers[call].setOpacity(opacity);
+          // Fade the callsign label tooltip via its DOM element
+          var tt = markers[call].getTooltip();
+          if (tt && tt._container) {
+            tt._container.style.opacity = opacity;
+          }
+        });
+      }
+      setInterval(updateStationAge, 60 * 1000);
+      updateStationAge();
       
       // HTML escape function to prevent XSS from untrusted APRS data
       function escapeHtml(str) {
@@ -648,10 +677,7 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
           map.removeLayer(markers[call]);
           delete markers[call];
         }
-        if (callsignLabels[call]) {
-          map.removeLayer(callsignLabels[call]);
-          delete callsignLabels[call];
-        }
+        // label is a Leaflet tooltip bound to the marker, removed with it
         if (stationTrails[call]) {
           stationTrails[call].forEach(function(seg) { map.removeLayer(seg); });
           delete stationTrails[call];
