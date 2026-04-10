@@ -1275,6 +1275,9 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.log_txt.setOpenLinks(False)  # Don't navigate - prevents clearing content
         self.log_txt.anchorClicked.connect(self._log_link_clicked)
         self.log_txt.setFont(QFont("Consolas", 10))
+        # Track whether user has scrolled up — pause auto-scroll when they have
+        self._log_autoscroll = True
+        self.log_txt.verticalScrollBar().valueChanged.connect(self._on_log_scroll)
         self.log_txt.setStyleSheet("""
             QTextBrowser {
                 background: #0a1628;
@@ -8766,6 +8769,11 @@ class MainWindow(MonitorsMixin, QMainWindow):
         else:
             self._log(f"{src}>{dst}: {info[:60]}")
 
+    def _on_log_scroll(self, value):
+        """Pause auto-scroll when user scrolls up, resume at bottom."""
+        sb = self.log_txt.verticalScrollBar()
+        self._log_autoscroll = (value >= sb.maximum() - 4)
+
     def _log(self, txt, color=None, no_ts=False):
         """Log text to the display. Optionally with color (HTML color code).
         
@@ -8811,7 +8819,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
             
             if not filter_text or filter_text in txt.upper():
                 self.log_txt.append(formatted)
-                self.log_txt.verticalScrollBar().setValue(self.log_txt.verticalScrollBar().maximum())
+                if getattr(self, '_log_autoscroll', True):
+                    self.log_txt.verticalScrollBar().setValue(
+                        self.log_txt.verticalScrollBar().maximum()
+                    )
         else:
             self.log_buf.append(txt)
     
@@ -8819,15 +8830,11 @@ class MainWindow(MonitorsMixin, QMainWindow):
         """Handle clicks on callsign links in the live feed."""
         url_str = url.toString()
         if url_str.startswith("aprs://pan/"):
-            # Extract callsign and pan to it on the map
             callsign = url_str.replace("aprs://pan/", "")
             if self.map_ready:
                 import json
                 js = f"panToStation({json.dumps(callsign)})"
                 self.map.page().runJavaScript(js)
-                # Switch to RX tab if not there
-                if hasattr(self, 'tabs'):
-                    self.tabs.setCurrentIndex(0)  # RX tab
         elif url_str.startswith("http://") or url_str.startswith("https://"):
             # External link - open in browser
             from PyQt6.QtGui import QDesktopServices

@@ -448,6 +448,13 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         var popupOpen = false;
         var openPopupMarker = null;
         
+        // Debug: log every map movement with stack trace
+        map.on('moveend', function() {
+          var c = map.getCenter();
+          var stack = new Error().stack.split('\n').slice(2, 5).join(' >> ');
+          console.log('[MAPDBG] MOVEEND center=' + c.lat.toFixed(4) + ',' + c.lng.toFixed(4) + ' zoom=' + map.getZoom() + ' STACK: ' + stack);
+        });
+
         map.on('popupopen', function(e) {
           popupOpen = true;
           openPopupMarker = e.popup._source;
@@ -688,11 +695,20 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       
       // Pan to station
       window.panToStation = function(call) {
-        if (markers[call]) {
-          var ll = markers[call].getLatLng();
-          map.setView(ll, 14);
-          markers[call].openPopup();
+        if (!markers[call]) {
+          console.log('[MAPDBG] panToStation: no marker for ' + call);
+          return;
         }
+        var ll = markers[call].getLatLng();
+        var currentZoom = map.getZoom();
+        var targetZoom = currentZoom < 13 ? 14 : currentZoom;
+        console.log('[MAPDBG] panToStation: ' + call + ' ll=' + ll.lat.toFixed(4) + ',' + ll.lng.toFixed(4));
+        map.setView(ll, targetZoom, { animate: false });
+        console.log('[MAPDBG] after setView=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4));
+        setTimeout(function() { console.log('[MAPDBG] 300ms center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 300);
+        setTimeout(function() { console.log('[MAPDBG] 1s center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 1000);
+        setTimeout(function() { console.log('[MAPDBG] 2s center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 2000);
+        setTimeout(function() { console.log('[MAPDBG] 3s center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 3000);
       };
 
       // Remove a killed object/item from the map
@@ -806,20 +822,40 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         var labelHtml = safeCall;
         
         if (existing) {
-          existing.setLatLng([lat, lon]);
+          var oldLL = existing.getLatLng();
+          if (Math.abs(oldLL.lat - lat) > 0.00001 || Math.abs(oldLL.lng - lon) > 0.00001) {
+            existing.setLatLng([lat, lon]);
+          }
           existing.setIcon(icon);
           existing.setPopupContent(popupHtml);
-          existing.setTooltipContent(labelHtml);
+          // Update tooltip content without triggering autopan
+          var tt = existing.getTooltip();
+          if (tt) {
+            tt.options.autoPan = false;
+            existing.setTooltipContent(labelHtml);
+          }
         } else {
-          markers[call] = L.marker([lat, lon], { icon: icon })
+          markers[call] = L.marker([lat, lon], {
+              icon: icon,
+              bubblingMouseEvents: false
+            })
             .addTo(map)
-            .bindPopup(popupHtml, { autoPan: true, autoPanPadding: [20, 20] })
+            .bindPopup(popupHtml, { autoPan: false })
             .bindTooltip(labelHtml, { 
               permanent: true,
               direction: 'right',
               offset: [6, 0],
-              className: 'callsign-label'
+              className: 'callsign-label',
+              autoPan: false
             });
+          // Click to toggle popup — no map movement
+          markers[call].on('mouseover', function() { this.openPopup(); });
+          markers[call].on('mouseout', function(e) {
+            var related = e.originalEvent.relatedTarget;
+            if (related && this.getPopup() && this.getPopup().getElement() &&
+                this.getPopup().getElement().contains(related)) return;
+            this.closePopup();
+          });
           markers[call]._basePopup = basePopup;
         }
         
@@ -999,8 +1035,13 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       // Center map on station
       window.centerOn = function(call) {
         if (markers[call]) {
-          map.setView(markers[call].getLatLng(), 13);
-          markers[call].openPopup();
+          var ll = markers[call].getLatLng();
+          var currentZoom = map.getZoom();
+          var targetZoom = currentZoom < 12 ? 13 : currentZoom;
+          map.flyTo(ll, targetZoom, { animate: true, duration: 0.4 });
+          setTimeout(function() {
+            if (markers[call]) markers[call].openPopup();
+          }, 450);
         }
       };
       
