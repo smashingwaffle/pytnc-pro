@@ -4,14 +4,16 @@ Handles: earthquakes, AQI, fires, weather alerts, hospitals, DARN repeaters
 Used as a mixin: class MainWindow(MonitorsMixin, ...)
 """
 
+import csv
 import json
 import shutil
 import time
 import urllib.parse
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QThreadPool
-from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QProgressDialog
 
 
 def _mg():
@@ -1575,4 +1577,491 @@ class MonitorsMixin:
             self.aqi_enabled.blockSignals(False)
         
         self._toggle_aqi_monitor(Qt.CheckState.Checked.value if enabled else Qt.CheckState.Unchecked.value)
+
+    # =========================================================================
+    # Locations (CSV/Excel load, map display, beacon)
+    # =========================================================================
+
+    def _load_locations_menu(self):
+        """Show menu to choose file or folder loading"""
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background: #1e3a5f; color: white; border: 1px solid #2d5a87; }
+            QMenu::item:selected { background: #2d5a87; }
+        """)
+        
+        file_action = menu.addAction("📄 Load File(s)")
+        folder_action = menu.addAction("📁 Load Folder")
+        
+        action = menu.exec(self.load_locations_btn.mapToGlobal(
+            self.load_locations_btn.rect().bottomLeft()))
+        
+        if action == file_action:
+            self._load_locations_files()
+        elif action == folder_action:
+            self._load_locations_folder()
     
+    def _load_locations_files(self):
+        """Load locations from multiple CSV/XLS files"""
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self, "Load Location Files", str(BASE_DIR),
+            "CSV/Excel Files (*.csv *.xlsx *.xls);;CSV Files (*.csv);;Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        if not filenames:
+            return
+        
+        total_loaded = 0
+        for filename in filenames:
+            count = self._load_single_location_file(Path(filename))
+            total_loaded += count
+        
+        if total_loaded > 0:
+            self._log(f"📍 Loaded {total_loaded} locations from {len(filenames)} files (total: {len(self.custom_locations)})")
+            self.location_count_lbl.setText(f"({len(self.custom_locations)})")
+            self.beacon_locations_btn.show()
+            self.clear_locations_btn.show()
+            self._display_locations_on_map()
+    
+    def _load_locations_folder(self):
+        """Load all CSV/XLS files from a folder"""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Locations Folder", str(BASE_DIR)
+        )
+        if not folder:
+            return
+        
+        folder_path = Path(folder)
+        files = list(folder_path.glob("*.csv")) + list(folder_path.glob("*.xlsx")) + list(folder_path.glob("*.xls"))
+        
+        if not files:
+            QMessageBox.warning(self, "No Files", f"No CSV or Excel files found in:\n{folder}")
+            return
+        
+        total_loaded = 0
+        for filepath in sorted(files):
+            count = self._load_single_location_file(filepath)
+            total_loaded += count
+        
+        if total_loaded > 0:
+            self._log(f"📍 Loaded {total_loaded} locations from {len(files)} files (total: {len(self.custom_locations)})")
+            self.location_count_lbl.setText(f"({len(self.custom_locations)})")
+            self.beacon_locations_btn.show()
+            self.clear_locations_btn.show()
+            self._display_locations_on_map()
+        
+        QMessageBox.information(self, "Folder Loaded",
+            f"Loaded {total_loaded} locations from {len(files)} files.")
+    
+    def _load_single_location_file(self, filepath: Path) -> int:
+        """Load locations from a single file. Returns count loaded."""
+        try:
+            locations = []
+            
+            if filepath.suffix.lower() == '.csv':
+                import csv
+                with open(filepath, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        name = row.get('Name', '').strip()
+                        lat_str = row.get('LAT', row.get('Lat', row.get('lat', ''))).strip()
+                        lon_str = row.get('Long', row.get('Lon', row.get('lon', ''))).strip()
+                        
+                        if not name or not lat_str or not lon_str:
+                            continue
+                        
+                        try:
+                            lat = float(lat_str)
+                            lon = float(lon_str)
+                        except ValueError:
+                            continue
+                        
+                        locations.append({
+                            'name': name,
+                            'address': row.get('Address', '').strip(),
+                            'lat': lat,
+                            'lon': lon,
+                            'symbol': row.get('Symbol', '\\h').strip(),
+                            'comment': row.get('Comment', '').strip(),
+                            'source': filepath.name
+                        })
+            
+            elif filepath.suffix.lower() in ('.xlsx', '.xls'):
+                try:
+                    import openpyxl
+                    wb = openpyxl.load_workbook(filepath)
+                    ws = wb.active
+                    headers = [cell.value for cell in ws[1]]
+                    
+                    for row in ws.iter_rows(min_row=2, values_only=True):
+                        row_dict = dict(zip(headers, row))
+                        name = str(row_dict.get('Name', '')).strip()
+                        lat_str = str(row_dict.get('LAT', row_dict.get('Lat', ''))).strip()
+                        lon_str = str(row_dict.get('Long', row_dict.get('Lon', ''))).strip()
+                        
+                        if not name or not lat_str or not lon_str:
+                            continue
+                        
+                        try:
+                            lat = float(lat_str)
+                            lon = float(lon_str)
+                        except ValueError:
+                            continue
+                        
+                        locations.append({
+                            'name': name,
+                            'address': str(row_dict.get('Address', '')).strip(),
+                            'lat': lat,
+                            'lon': lon,
+                            'symbol': str(row_dict.get('Symbol', '\\h')).strip(),
+                            'comment': str(row_dict.get('Comment', '')).strip(),
+                            'source': filepath.name
+                        })
+                except ImportError:
+                    self._log(f"⚠️ Skipped {filepath.name} - openpyxl not installed")
+                    return 0
+            
+            if locations:
+                # Deduplicate: don't add if same name+lat+lon already exists
+                existing_keys = {(loc['name'], round(loc['lat'], 5), round(loc['lon'], 5)) 
+                                 for loc in self.custom_locations}
+                new_locations = []
+                for loc in locations:
+                    key = (loc['name'], round(loc['lat'], 5), round(loc['lon'], 5))
+                    if key not in existing_keys:
+                        new_locations.append(loc)
+                        existing_keys.add(key)
+                
+                if new_locations:
+                    self.custom_locations.extend(new_locations)
+                    self._log(f"  📄 {filepath.name}: {len(new_locations)} new locations")
+                    return len(new_locations)
+                else:
+                    self._log(f"  ⚠️ {filepath.name}: all {len(locations)} locations already loaded")
+                    return 0
+            
+            return 0
+            
+        except Exception as e:
+            self._log(f"⚠️ Error loading {filepath.name}: {e}")
+            return 0
+
+    def _display_locations_on_map(self):
+        """Display custom locations on the map"""
+        if not self.map_ready or not self.custom_locations:
+            return
+        
+        # Clear existing custom markers first
+        self.map.page().runJavaScript("clearCustomLocations()")
+        
+        for loc in self.custom_locations:
+            name = loc['name']
+            lat = loc['lat']
+            lon = loc['lon']
+            symbol = loc.get('symbol', '\\h')
+            comment = loc.get('comment', '')
+            address = loc.get('address', '')
+            
+            # Escape for JavaScript
+            name_js = json.dumps(name)
+            comment_js = json.dumps(comment)
+            address_js = json.dumps(address)
+            symbol_js = json.dumps(symbol)
+            
+            js = f"addCustomLocation({name_js}, {lat}, {lon}, {symbol_js}, {comment_js}, {address_js})"
+            self.map.page().runJavaScript(js)
+        
+        self._log(f"📍 Displayed {len(self.custom_locations)} locations on map")
+    
+    def _clear_locations(self):
+        """Clear all loaded locations"""
+        if not self.custom_locations:
+            return
+        
+        count = len(self.custom_locations)
+        self.custom_locations = []
+        
+        # Clear map markers
+        if self.map_ready:
+            self.map.page().runJavaScript("clearCustomLocations()")
+        
+        # Hide buttons and clear label
+        self.beacon_locations_btn.hide()
+        self.clear_locations_btn.hide()
+        self.location_count_lbl.setText("")
+        
+        self._log(f"🗑️ Cleared {count} locations")
+    
+    def _beacon_locations_menu(self):
+        """Show menu to choose RF or APRS-IS beacon"""
+        if not self.custom_locations:
+            self._log("❌ No locations to beacon")
+            return
+        
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background: #1e3a5f; color: white; border: 1px solid #2d5a87; }
+            QMenu::item:selected { background: #2d5a87; }
+        """)
+        
+        rf_action = menu.addAction("📻 Beacon via RF (Simplex)")
+        is_action = menu.addAction("🌐 Beacon via APRS-IS")
+        menu.addSeparator()
+        cancel_action = menu.addAction("Cancel")
+        
+        action = menu.exec(self.beacon_locations_btn.mapToGlobal(
+            self.beacon_locations_btn.rect().bottomLeft()))
+        
+        if action == rf_action:
+            self._beacon_locations_rf()
+        elif action == is_action:
+            self._beacon_all_locations()
+    
+    def _beacon_locations_rf(self):
+        """Beacon all locations as APRS objects via RF"""
+        if not self.custom_locations:
+            self._log("❌ No locations to beacon")
+            return
+        
+        if not HAS_SOUNDDEVICE:
+            QMessageBox.warning(self, "RF Disabled", 
+                "sounddevice not installed.\nRF AFSK transmit is disabled.")
+            return
+        
+        callsign = self.callsign_edit.text().strip().upper()
+        if not callsign or callsign == "N0CALL":
+            QMessageBox.warning(self, "No Callsign", "Set your callsign first")
+            return
+        
+        ssid = self.ssid_combo.currentData()
+        full_call = f"{callsign}-{ssid}" if ssid > 0 else callsign
+        path_str = self.path_combo.currentText().strip()
+        
+        # Parse path
+        path_list = []
+        if path_str and path_str.upper() != "DIRECT":
+            for p in path_str.split(","):
+                p = p.strip()
+                if "-" in p:
+                    pcall, pssid = p.rsplit("-", 1)
+                    path_list.append((pcall, int(pssid)))
+                else:
+                    path_list.append((p, 0))
+        
+        # Check PTT
+        if not self.ptt_serial or not self.ptt_serial.is_open:
+            ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
+            if ptt_port:
+                try:
+                    self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
+                    self._set_ptt(False)
+                    self._log(f"✅ Auto-connected PTT: {ptt_port}")
+                except Exception as e:
+                    QMessageBox.warning(self, "PTT Error", f"Could not connect PTT:\n{e}")
+                    return
+            else:
+                QMessageBox.warning(self, "PTT Not Configured", "Configure PTT in Settings")
+                return
+        
+        # Get TX audio device
+        tx_device = self.settings_tx_audio_combo.currentData() if hasattr(self, 'settings_tx_audio_combo') else None
+        if tx_device is None:
+            QMessageBox.warning(self, "No TX Audio", "Select TX audio device in Settings")
+            return
+        
+        tx_level_pct = self.settings_tx_level.value() if hasattr(self, 'settings_tx_level') else 10
+        
+        # Timestamp
+        from datetime import datetime
+        now = datetime.utcnow()
+        timestamp = now.strftime("%d%H%M") + "z"
+        
+        # Confirm
+        reply = QMessageBox.question(self, "Beacon Locations via RF",
+            f"Beacon {len(self.custom_locations)} locations via RF?\n\n"
+            f"Path: {path_str}\n"
+            f"This will take ~{len(self.custom_locations) * 3} seconds.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        self._log(f"📻 Starting RF beacon of {len(self.custom_locations)} locations...")
+        self.tx_in_progress = True
+        sent = 0
+        
+        try:
+            for i, loc in enumerate(self.custom_locations):
+                name = loc['name'][:9].ljust(9)
+                lat = loc['lat']
+                lon = loc['lon']
+                symbol = loc.get('symbol', '\\h')
+                address = loc.get('address', '')
+                comment = loc.get('comment', '')
+                # Combine address and comment (address first)
+                full_comment = f"{address} {comment}".strip()[:43]
+                
+                # Parse symbol
+                sym_table = symbol[0] if len(symbol) >= 1 else '\\'
+                sym_code = symbol[1] if len(symbol) >= 2 else 'h'
+                
+                # Format position
+                lat_deg = int(abs(lat))
+                lat_min = (abs(lat) - lat_deg) * 60
+                lat_dir = "N" if lat >= 0 else "S"
+                lon_deg = int(abs(lon))
+                lon_min = (abs(lon) - lon_deg) * 60
+                lon_dir = "E" if lon >= 0 else "W"
+                
+                # APRS Object format
+                info = f";{name}*{timestamp}{lat_deg:02d}{lat_min:05.2f}{lat_dir}{sym_table}{lon_deg:03d}{lon_min:05.2f}{lon_dir}{sym_code}{full_comment}"
+                
+                self._log(f"📡 TX [{i+1}/{len(self.custom_locations)}]: {name.strip()}")
+                
+                # Build packet
+                packet_data = APRSPacketBuilder.build_ui_packet(
+                    src_call=callsign, src_ssid=ssid,
+                    dst_call="APPR01", dst_ssid=0,
+                    path=path_list,
+                    info=info
+                )
+                fcs = APRSPacketBuilder.compute_fcs(packet_data)
+                full_packet = packet_data + bytes([fcs & 0xFF, (fcs >> 8) & 0xFF])
+                
+                # Generate audio
+                modulator = AFSKModulator(TX_SAMPLE_RATE)
+                audio = modulator.generate_packet_audio(full_packet, preamble_flags=50, postamble_flags=8)
+                
+                # Add silence
+                silence = np.zeros(int(TX_SAMPLE_RATE * 0.03), dtype=np.float32)
+                audio = np.concatenate([silence, audio, silence])
+                
+                # Apply level
+                audio = apply_cosine_ramp(audio, TX_SAMPLE_RATE, ramp_ms=5.0)
+                audio = audio * (tx_level_pct / 100.0)
+                
+                # Soft limit
+                if float(np.abs(audio).max()) > 0.9:
+                    audio = np.tanh(audio * 1.5) * 0.9
+                
+                # Get device info for resampling
+                device_info = sd.query_devices(tx_device)
+                device_sr = int(device_info.get('default_samplerate', 48000))
+                max_ch = device_info.get('max_output_channels', 1)
+                
+                if device_sr != TX_SAMPLE_RATE:
+                    from scipy import signal as scipy_signal
+                    num_samples = int(len(audio) * device_sr / TX_SAMPLE_RATE)
+                    audio = scipy_signal.resample(audio, num_samples).astype(np.float32)
+                
+                if max_ch >= 2:
+                    audio_out = np.column_stack([audio, audio]).astype(np.float32)
+                else:
+                    audio_out = audio.astype(np.float32)
+                
+                # Key PTT
+                self._set_ptt(True)
+                time.sleep(0.5)  # Let radio settle
+                
+                # Play audio
+                sd.play(audio_out, device_sr, device=tx_device)
+                sd.wait()
+                
+                # Unkey PTT
+                time.sleep(0.15)
+                self._set_ptt(False)
+                
+                sent += 1
+                
+                # Pause between packets
+                if i < len(self.custom_locations) - 1:
+                    time.sleep(1.5)
+                
+                QApplication.processEvents()
+                
+        except Exception as e:
+            self._log(f"❌ RF beacon error: {e}")
+            QMessageBox.warning(self, "Error", f"RF beacon failed:\n{e}")
+        finally:
+            self.tx_in_progress = False
+            self._set_ptt(False)
+        
+        self._log(f"📻 RF beacon complete: {sent}/{len(self.custom_locations)} sent")
+        QMessageBox.information(self, "RF Beacon Complete",
+            f"Sent {sent} location objects via RF.")
+
+    def _beacon_all_locations(self):
+        """Beacon all locations as APRS objects"""
+        if not self.custom_locations:
+            self._log("❌ No locations to beacon")
+            return
+        
+        callsign = self.callsign_edit.text().strip().upper()
+        if not callsign or callsign == "N0CALL":
+            QMessageBox.warning(self, "No Callsign", "Set your callsign first")
+            return
+        
+        # Check if APRS-IS connected
+        if not (hasattr(self, 'aprs_is_socket') and self.aprs_is_socket):
+            QMessageBox.warning(self, "Not Connected", 
+                "Connect to APRS-IS first to beacon objects.\n\n"
+                "Go to Settings → APRS-IS and connect.")
+            return
+        
+        ssid = self.ssid_combo.currentData()
+        full_call = f"{callsign}-{ssid}" if ssid > 0 else callsign
+        
+        # Timestamp (DHM format for objects)
+        from datetime import datetime
+        now = datetime.utcnow()
+        timestamp = now.strftime("%d%H%M") + "z"
+        
+        sent = 0
+        for loc in self.custom_locations:
+            try:
+                name = loc['name'][:9].ljust(9)  # Object names are 9 chars
+                lat = loc['lat']
+                lon = loc['lon']
+                symbol = loc.get('symbol', '\\h')
+                address = loc.get('address', '')
+                comment = loc.get('comment', '')
+                # Combine address and comment (address first)
+                full_comment = f"{address} {comment}".strip()[:43]
+                
+                # Parse symbol table/code
+                if len(symbol) >= 2:
+                    sym_table = symbol[0]
+                    sym_code = symbol[1]
+                else:
+                    sym_table = '\\'
+                    sym_code = 'h'
+                
+                # Format position
+                lat_deg = int(abs(lat))
+                lat_min = (abs(lat) - lat_deg) * 60
+                lat_dir = "N" if lat >= 0 else "S"
+                
+                lon_deg = int(abs(lon))
+                lon_min = (abs(lon) - lon_deg) * 60
+                lon_dir = "E" if lon >= 0 else "W"
+                
+                # APRS Object format: ;NAME*DDHHMMz/DDMM.MMN/DDDMM.MMWsComment
+                # ; = object, * = live object, _ = killed object
+                info = f";{name}*{timestamp}{lat_deg:02d}{lat_min:05.2f}{lat_dir}{sym_table}{lon_deg:03d}{lon_min:05.2f}{lon_dir}{sym_code}{full_comment}"
+                
+                packet = f"{full_call}>APPR01,TCPIP*:{info}\r\n"
+                self.aprs_is_socket.send(packet.encode())
+                sent += 1
+                
+                # Small delay between packets
+                time.sleep(0.1)
+                
+            except Exception as e:
+                self._log(f"⚠️ Failed to beacon {loc['name']}: {e}")
+        
+        self._log(f"📡 Beaconed {sent}/{len(self.custom_locations)} location objects")
+        QMessageBox.information(self, "Beaconed", 
+            f"Sent {sent} location objects via APRS-IS.\n\n"
+            f"They should appear on aprs.fi within a minute.")
+

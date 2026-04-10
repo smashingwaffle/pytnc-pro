@@ -601,6 +601,30 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       // Run pruning every 5 minutes
       setInterval(pruneOldMarkers, 5 * 60 * 1000);
 
+      // Filter stations by age — called from Show Last dropdown
+      // cutoffMs: hide stations older than this many milliseconds
+      var _showLastCutoffMs = 0;  // 0 = show all
+      function filterStationsByAge(cutoffMs) {
+        _showLastCutoffMs = cutoffMs;
+        var now = Date.now();
+        Object.keys(markers).forEach(function(call) {
+          var age = now - (markers[call]._lastUpdate || now);
+          var hidden = cutoffMs > 0 && age > cutoffMs;
+          if (hidden) {
+            map.removeLayer(markers[call]);
+            var tt = markers[call].getTooltip();
+            if (tt && tt._container) tt._container.style.display = 'none';
+          } else {
+            if (!map.hasLayer(markers[call])) {
+              markers[call].addTo(map);
+            }
+            var tt = markers[call].getTooltip();
+            if (tt && tt._container) tt._container.style.display = '';
+          }
+        });
+      }
+
+
       // Station age fading — run every 60 seconds
       // Fresh (<30min): full opacity | Aging (30min-2h): fade to 40% | Old (>2h): 25%
       function updateStationAge() {
@@ -804,6 +828,14 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         markers[call]._iconUrl = iconUrl;
         markers[call]._tooltipRaw = tooltip;
         markers[call]._pathRaw = path;
+
+        // Apply active Show Last filter to newly added station
+        if (_showLastCutoffMs > 0) {
+          var age = Date.now() - markers[call]._lastUpdate;
+          if (age > _showLastCutoffMs) {
+            map.removeLayer(markers[call]);
+          }
+        }
         
         // Track digipeaters
         if (path) {
