@@ -12,7 +12,7 @@ Features:
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.5-beta"
+__version__ = "0.1.6-beta"
 VERSION = __version__
 
 import sys
@@ -869,6 +869,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.gps_lat = None
         self.gps_lon = None
         self.gps_has_fix = False
+        self.gps_elevation_m = None
+        self.gps_elevation_ft = None
+        self._last_elev_lat = None
+        self._last_elev_lon = None
         self.gps_speed_mph = 0.0
         self.gps_course = 0.0
         self.gps_buffer = ""  # Buffer for NMEA sentence assembly
@@ -1110,12 +1114,6 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.rx_weather_check.stateChanged.connect(self._rx_toggle_weather)
         ctrl_layout.addWidget(self.rx_weather_check)
         
-        # DARN emergency repeaters toggle
-        self.rx_darn_check = QCheckBox("🔴 DARN")
-        self.rx_darn_check.setToolTip("Show DARN emergency repeater network")
-        self.rx_darn_check.setStyleSheet("color: #ff6b6b; font-size: 11px;")
-        self.rx_darn_check.stateChanged.connect(self._rx_toggle_darn)
-        ctrl_layout.addWidget(self.rx_darn_check)
         
         # Fire/wildfire toggle (NASA FIRMS)
         self.rx_fire_check = QCheckBox("🔥 Fires")
@@ -1697,9 +1695,19 @@ class MainWindow(MonitorsMixin, QMainWindow):
         loc_layout.addWidget(self.gps_source_label)
         loc_layout.addStretch()
         beacon_layout.addLayout(loc_layout, 1, 1)
-        
+
+        # Row 1b: Elevation (from USGS topo, populated when GPS fix acquired)
+        self.elevation_label = QLabel("⛰️ Elevation: --")
+        self.elevation_label.setStyleSheet("""
+            color: #80cbc4;
+            font-size: 11px;
+            padding: 1px 4px;
+        """)
+        self.elevation_label.setToolTip("Elevation from USGS National Map (fetched automatically with GPS fix)")
+        beacon_layout.addWidget(self.elevation_label, 2, 1)
+
         # Row 2: Symbol and Path on same row
-        beacon_layout.addWidget(QLabel("Symbol:"), 2, 0)
+        beacon_layout.addWidget(QLabel("Symbol:"), 3, 0)
         sym_path_layout = QHBoxLayout()
         # Hidden fields to store symbol data (used by symbol picker)
         self.symbol_table_combo = QComboBox()
@@ -1730,10 +1738,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.path_combo.currentTextChanged.connect(self._on_path_changed)
         sym_path_layout.addWidget(self.path_combo)
         sym_path_layout.addStretch()
-        beacon_layout.addLayout(sym_path_layout, 2, 1)
+        beacon_layout.addLayout(sym_path_layout, 3, 1)
         
         # Row 3: Radio
-        beacon_layout.addWidget(QLabel("Radio:"), 3, 0)
+        beacon_layout.addWidget(QLabel("Radio:"), 4, 0)
         self.radio_combo = QComboBox()
         self.radio_combo.setEditable(True)
         self.radio_combo.addItems([
@@ -1753,12 +1761,12 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "Kenwood TH-D74",
         ])
         self.radio_combo.setToolTip("Your radio (optional)")
-        beacon_layout.addWidget(self.radio_combo, 3, 1)
+        beacon_layout.addWidget(self.radio_combo, 4, 1)
         
         # Row 4: Comment
-        beacon_layout.addWidget(QLabel("Comment:"), 4, 0)
+        beacon_layout.addWidget(QLabel("Comment:"), 5, 0)
         self.comment_edit = QLineEdit("PyTNC Pro")
-        beacon_layout.addWidget(self.comment_edit, 4, 1)
+        beacon_layout.addWidget(self.comment_edit, 5, 1)
         
         # Hidden TX Audio combo (for compatibility - actual control in Settings tab)
         self.tx_audio_combo = QComboBox()
@@ -2071,12 +2079,12 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.custom_links_file = BASE_DIR / "pytnc_links.json"
         self.custom_links = self._load_custom_links()
         
-        # Define built-in link categories - Emergency Comms FIRST
+        # Define built-in link categories
         builtin_categories = [
+            ("📖 PyTNC Pro", [
+                ("PyTNC Pro Wiki", "https://github.com/smashingwaffle/pytnc-pro/wiki"),
+            ]),
             ("🚨 Emergency Comms", [
-                ("LAXNORTHEAST", "https://www.laxnortheast.org/"),
-                ("LAXNORTHEAST Radio Plan", "https://docs.google.com/spreadsheets/d/1LGbFTBhhlHhICyrq31NAcdWQqQxdpF2E0W3g7aA2oxc/edit?gid=480461466#gid=480461466"),
-                ("LA County EMS Agency", "https://dhs.lacounty.gov/emergency-medical-services-agency/"),
                 ("FEMA", "https://www.fema.gov"),
                 ("ARRL ARES", "http://www.arrl.org/ares"),
                 ("Ready.gov", "https://www.ready.gov"),
@@ -2093,17 +2101,13 @@ class MainWindow(MonitorsMixin, QMainWindow):
             ]),
             ("📡 Repeaters & Frequencies", [
                 ("RadioReference", "https://www.radioreference.com"),
+                ("RepeaterBook", "https://www.repeaterbook.com"),
                 ("ARRL Band Plan", "https://www.arrl.org/band-plan"),
             ]),
             ("📚 Learning & License", [
                 ("ARRL - Ham Radio", "https://www.arrl.org"),
                 ("QRZ Callsign Lookup", "https://www.qrz.com"),
                 ("HamStudy.org", "https://hamstudy.org"),
-            ]),
-            ("🔧 Software & Tools", [
-                ("Winlink", "https://winlink.org"),
-                ("VARA FM", "https://rosmodem.wordpress.com"),
-                ("Direwolf TNC", "https://github.com/wb2osz/direwolf"),
             ]),
         ]
         
@@ -2799,11 +2803,6 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.cache_digi_btn.clicked.connect(self._cache_digipeaters)
         cache_layout.addWidget(self.cache_digi_btn, 2, 4)
         
-        # DARN - import from Excel
-        cache_layout.addWidget(QLabel("🔴 DARN:"), 3, 0)
-        self.cache_darn_status = QLabel("Built-in 41")
-        self.cache_darn_status.setStyleSheet("color: #ff6b6b; font-size: 10px;")
-        cache_layout.addWidget(self.cache_darn_status, 3, 2, 1, 2)
         
         mid_col.addWidget(cache_grp)
         
@@ -3108,6 +3107,28 @@ class MainWindow(MonitorsMixin, QMainWindow):
         tx_l.addStretch()
         top_row.addWidget(tx_grp)
         layout.addLayout(top_row)
+
+        # ── IGate Beacon Config ───────────────────────────────────────────────
+        beacon_cfg_grp = QGroupBox("📡 IGate Beacon Info")
+        beacon_cfg_grp.setStyleSheet(GRP)
+        beacon_cfg_l = QGridLayout(beacon_cfg_grp)
+        beacon_cfg_l.setSpacing(6)
+
+        beacon_cfg_l.addWidget(QLabel("Frequency:"), 0, 0)
+        self.igate_freq_edit = QLineEdit("144.390MHz")
+        self.igate_freq_edit.setPlaceholderText("e.g. 144.390MHz")
+        self.igate_freq_edit.setToolTip("RF frequency being monitored (shown in IGate beacon)")
+        self.igate_freq_edit.setStyleSheet("background:#0a1929;color:#ffd54f;border:1px solid #1e3a5f;border-radius:4px;padding:3px 6px;")
+        beacon_cfg_l.addWidget(self.igate_freq_edit, 0, 1)
+
+        beacon_cfg_l.addWidget(QLabel("Location:"), 1, 0)
+        self.igate_location_edit = QLineEdit()
+        self.igate_location_edit.setPlaceholderText("e.g. Los Angeles CA")
+        self.igate_location_edit.setToolTip("Location description shown in IGate beacon comment")
+        self.igate_location_edit.setStyleSheet("background:#0a1929;color:#ffd54f;border:1px solid #1e3a5f;border-radius:4px;padding:3px 6px;")
+        beacon_cfg_l.addWidget(self.igate_location_edit, 1, 1)
+
+        layout.addWidget(beacon_cfg_grp)
 
         # ── Recent gated packets log ──────────────────────────────────────────
         log_grp = QGroupBox("📋 Recently Gated Packets")
@@ -3480,7 +3501,11 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 return
 
             # Get position
-            lat = self.gps_lat if (hasattr(self, 'gps_has_fix') and self.gps_has_fix) else None
+            lat = None
+            lon = None
+            if hasattr(self, 'gps_has_fix') and self.gps_has_fix and self.gps_lat is not None:
+                lat = self.gps_lat
+                lon = self.gps_lon
             if lat is None:
                 manual_text = self.manual_location.text().strip() if hasattr(self, 'manual_location') else ""
                 if manual_text:
@@ -3505,15 +3530,50 @@ class MainWindow(MonitorsMixin, QMainWindow):
             # I& = IGate overlay symbol
             symbol_table = "I"
             symbol_code = "&"
-            comment = self.comment_edit.text().strip() if hasattr(self, 'comment_edit') else "PyTNC Pro IGate"
-            if not comment:
-                comment = "PyTNC Pro IGate"
+
+            # Build beacon comment with frequency, mode, software, location
+            freq = self.igate_freq_edit.text().strip() if hasattr(self, 'igate_freq_edit') else "144.390MHz"
+            location = self.igate_location_edit.text().strip() if hasattr(self, 'igate_location_edit') else ""
+            rx_tx = self.igate_tx_check.isChecked() if hasattr(self, 'igate_tx_check') else False
+            mode_str = "RxTx" if rx_tx else "Rx"
+            comment_parts = [f"PyTNC Pro {mode_str}"]
+            if freq:
+                comment_parts.append(freq)
+            if location:
+                comment_parts.append(location)
+            comment = " | ".join(comment_parts)
 
             pos = f"!{lat_deg:02d}{lat_min:05.2f}{lat_dir}{symbol_table}{lon_deg:03d}{lon_min:05.2f}{lon_dir}{symbol_code}{comment[:43]}"
             packet = f"{full_call}>APPR01,TCPIP*:{pos}\r\n"
             self.aprs_is_socket.send(packet.encode())
             self._igate_log_entry(f"📡 IGate beacon sent: {full_call} I& symbol", "#69f0ae")
             self._log(f"🌐 IGate beacon: {full_call} with IGate symbol")
+
+            # Plot on our own map using IGate symbol (I& overlay)
+            if self.map_ready:
+                try:
+                    ic, ov = icon_path("I", "&")
+                    if ov:
+                        ic = make_overlay(ic, ov)
+                    try:
+                        rel_path = ic.relative_to(BASE_DIR)
+                        icon_url = f"http://127.0.0.1:{self.http_port}/{rel_path.as_posix()}"
+                    except ValueError:
+                        icon_url = f"http://127.0.0.1:{self.http_port}/aprs_symbols_48/primary/29.png"
+                    tooltip_parts = [
+                        f"📡 PyTNC Pro v{VERSION}",
+                        f"🌐 IGate",
+                        f"💬 {comment[:43]}",
+                        f"🕐 {datetime.now().strftime('%H:%M:%S')}",
+                    ]
+                    if hasattr(self, 'gps_elevation_ft') and self.gps_elevation_ft is not None:
+                        tooltip_parts.insert(2, f"⛰️ {self.gps_elevation_ft:,} ft ({self.gps_elevation_m:.0f} m)")
+                    tooltip = "<br>".join(tooltip_parts)
+                    import json
+                    js = f"queueStation({json.dumps(full_call)},{lat},{lon},'{icon_url}',{json.dumps(tooltip)},false,\"\")"
+                    self.map.page().runJavaScript(js)
+                except Exception:
+                    pass
         except Exception as e:
             self._igate_log_entry(f"⚠️ IGate beacon error: {e}", "#ef5350")
 
@@ -3656,9 +3716,19 @@ class MainWindow(MonitorsMixin, QMainWindow):
         vara_loc_layout.addWidget(self.vara_gps_source)
         vara_loc_layout.addStretch()
         vara_beacon_layout.addLayout(vara_loc_layout, 1, 1)
-        
+
+        # Row 1b: Elevation
+        self.vara_elevation_label = QLabel("⛰️ Elevation: --")
+        self.vara_elevation_label.setStyleSheet("""
+            color: #80cbc4;
+            font-size: 11px;
+            padding: 1px 4px;
+        """)
+        self.vara_elevation_label.setToolTip("Elevation from USGS National Map")
+        vara_beacon_layout.addWidget(self.vara_elevation_label, 2, 1)
+
         # Row 2: Symbol and Path (VARA uses digipeater, not WIDE path)
-        vara_beacon_layout.addWidget(QLabel("Symbol:"), 2, 0)
+        vara_beacon_layout.addWidget(QLabel("Symbol:"), 3, 0)
         vara_sym_layout = QHBoxLayout()
         self.vara_symbol_preview = QLabel()
         self.vara_symbol_preview.setFixedSize(28, 28)
@@ -3685,7 +3755,7 @@ class MainWindow(MonitorsMixin, QMainWindow):
         vara_beacon_layout.addLayout(vara_sym_layout, 2, 1)
         
         # Row 3: Radio
-        vara_beacon_layout.addWidget(QLabel("Radio:"), 3, 0)
+        vara_beacon_layout.addWidget(QLabel("Radio:"), 4, 0)
         self.vara_radio_combo = QComboBox()
         self.vara_radio_combo.setEditable(True)
         self.vara_radio_combo.addItems([
@@ -3697,7 +3767,7 @@ class MainWindow(MonitorsMixin, QMainWindow):
         vara_beacon_layout.addWidget(self.vara_radio_combo, 3, 1)
         
         # Row 4: Comment
-        vara_beacon_layout.addWidget(QLabel("Comment:"), 4, 0)
+        vara_beacon_layout.addWidget(QLabel("Comment:"), 5, 0)
         self.vara_comment_edit = QLineEdit("PyTNC Pro")
         vara_beacon_layout.addWidget(self.vara_comment_edit, 4, 1)
         
@@ -4148,7 +4218,47 @@ class MainWindow(MonitorsMixin, QMainWindow):
         if hasattr(self, 'vara_gps_source'):
             self.vara_gps_source.setText("🛰️ GPS LIVE")
             self.vara_gps_source.setStyleSheet("color: #69f0ae; font-weight: bold;")
+
+        # Fetch elevation from USGS topo API
+        self._fetch_elevation_if_needed(lat, lon)
     
+    def _fetch_elevation_if_needed(self, lat: float, lon: float):
+        """Fetch elevation from Open-Meteo API when location changes."""
+        if hasattr(self, '_last_elev_lat') and self._last_elev_lat is not None:
+            if abs(lat - self._last_elev_lat) < 0.001 and abs(lon - self._last_elev_lon) < 0.001:
+                return
+        self._last_elev_lat = lat
+        self._last_elev_lon = lon
+
+        # Open-Meteo elevation API — fast, free, no key needed
+        from PyQt6.QtCore import QThreadPool
+        url = f"https://api.open-meteo.com/v1/elevation?latitude={lat:.6f}&longitude={lon:.6f}"
+        worker = NetworkFetchWorker(url, timeout=8)
+
+        def _on_result(data):
+            try:
+                elev_m = float(data["elevation"][0])
+                elev_ft = int(elev_m * 3.28084)
+                self.gps_elevation_m = elev_m
+                self.gps_elevation_ft = elev_ft
+                self._log(f"⛰️ Elevation: {elev_ft:,} ft ({elev_m:.0f} m)")
+                elev_text = f"⛰️ Elevation: {elev_ft:,} ft  ({elev_m:.0f} m)"
+                if hasattr(self, 'elevation_label'):
+                    self.elevation_label.setText(elev_text)
+                if hasattr(self, 'vara_elevation_label'):
+                    self.vara_elevation_label.setText(elev_text)
+                if hasattr(self, 'tx_gps_status'):
+                    self.tx_gps_status.setText(f"🟢 GPS | ⛰️ {elev_ft} ft")
+            except Exception as e:
+                self._log(f"⛰️ Elevation parse error: {e}")
+
+        def _on_error(err):
+            self._log(f"⛰️ Elevation fetch failed: {err}")
+
+        worker.signals.finished.connect(_on_result)
+        worker.signals.error.connect(_on_error)
+        QThreadPool.globalInstance().start(worker)
+
     def _update_gps_status(self, has_fix: bool, speed_mph: float = 0):
         """Update GPS status display"""
         self.gps_speed_mph = speed_mph  # Store for SmartBeaconing
@@ -5064,6 +5174,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         if not self.aprs_is_running or not self.aprs_is_socket:
             self._log("❌ APRS-IS not connected!")
+            if hasattr(self, 'preset_log'):
+                self.preset_log.append("<span style='color:#ef5350'>❌ APRS-IS not connected!</span>")
             return
         
         # Get beacon data
@@ -5120,9 +5232,15 @@ class MainWindow(MonitorsMixin, QMainWindow):
         lon_dir = "E" if lon >= 0 else "W"
         
         pos = f"!{lat_deg:02d}{lat_min:05.2f}{lat_dir}{symbol_table}{lon_deg:03d}{lon_min:05.2f}{lon_dir}{symbol_code}"
-        if comment:
-            # APRS-IS can handle longer comments than RF
-            pos += comment[:80]
+        # Build comment — append /A= altitude if we have elevation from USGS
+        beacon_comment = comment[:60] if comment else ""
+        if hasattr(self, 'gps_elevation_ft') and self.gps_elevation_ft is not None:
+            beacon_comment += f" /A={self.gps_elevation_ft:06d}"
+            self._log(f"⛰️ Adding elevation to beacon: {self.gps_elevation_ft} ft")
+        else:
+            self._log("⛰️ No elevation data yet — beacon sent without altitude")
+        if beacon_comment:
+            pos += beacon_comment
         
         packet = f"{full_call}>APPR01,TCPIP*:{pos}\r\n"
         self._log(f"📤 Sending: {packet.strip()}")
@@ -5153,9 +5271,14 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 
                 # Build tooltip
                 tooltip_parts = []
-                tooltip_parts.append("📻 PyTNC Pro")
+                tooltip_parts.append(f"📡 PyTNC Pro v{VERSION}")
+                radio_is = self.radio_combo.currentText().strip() if hasattr(self, 'radio_combo') else ""
+                if radio_is:
+                    tooltip_parts.append(f"📻 {radio_is}")
                 if comment:
                     tooltip_parts.append(f"💬 {clean_aprs_comment(comment, 60)}")
+                if hasattr(self, 'gps_elevation_ft') and self.gps_elevation_ft is not None:
+                    tooltip_parts.append(f"⛰️ {self.gps_elevation_ft:,} ft ({self.gps_elevation_m:.0f} m)")
                 tooltip_parts.append(f"🌐 APRS-IS")
                 tooltip_parts.append(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
                 tooltip = "<br>".join(tooltip_parts)
@@ -7304,6 +7427,13 @@ class MainWindow(MonitorsMixin, QMainWindow):
             full_comment = f"{comment} [{radio}]" if comment else f"[{radio}]"
         else:
             full_comment = comment
+
+        # Append elevation if available
+        if hasattr(self, 'gps_elevation_ft') and self.gps_elevation_ft is not None:
+            full_comment += f" /A={self.gps_elevation_ft:06d}"
+            self._log(f"⛰️ Adding elevation to RF beacon: {self.gps_elevation_ft} ft")
+        else:
+            self._log("⛰️ No elevation yet for RF beacon")
         
         if not callsign or callsign == "N0CALL":
             QMessageBox.warning(self, "Invalid Callsign", "Please enter your callsign")
@@ -7312,6 +7442,13 @@ class MainWindow(MonitorsMixin, QMainWindow):
         # Auto-connect PTT if not connected
         ptt_auto_connected = False
         if not self.ptt_serial or not self.ptt_serial.is_open:
+            # Clean up any dead serial object first
+            if self.ptt_serial:
+                try:
+                    self.ptt_serial.close()
+                except Exception:
+                    pass
+                self.ptt_serial = None
             ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
             if ptt_port:
                 try:
@@ -7320,8 +7457,14 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     ptt_auto_connected = True
                     self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
                     self._update_tx_status()
+                except serial.SerialException as e:
+                    self.ptt_serial = None
+                    QMessageBox.warning(self, "PTT Connection Failed",
+                        f"Could not open {ptt_port}:\n{e}\n\nIs the radio/interface connected?")
+                    return
                 except Exception as e:
-                    QMessageBox.warning(self, "PTT Connection Failed", f"Could not connect PTT:\n{e}\n\nConfigure in Settings tab.")
+                    self.ptt_serial = None
+                    QMessageBox.warning(self, "PTT Connection Failed", f"Could not connect PTT:\n{e}")
                     return
             else:
                 QMessageBox.warning(self, "PTT Not Configured", "Configure PTT port in Settings tab first")
@@ -7500,13 +7643,13 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 
                 # Clean tooltip - just radio and comment (no duplication)
                 tooltip_parts = []
+                tooltip_parts.append(f"📡 PyTNC Pro v{VERSION}")
                 if radio:
                     tooltip_parts.append(f"📻 {radio}")
-                else:
-                    tooltip_parts.append("📻 PyTNC Pro")
                 if comment:
                     tooltip_parts.append(f"💬 {clean_aprs_comment(comment, 80)}")
-                # Add timestamp
+                if hasattr(self, 'gps_elevation_ft') and self.gps_elevation_ft is not None:
+                    tooltip_parts.append(f"⛰️ {self.gps_elevation_ft:,} ft ({self.gps_elevation_m:.0f} m)")
                 tooltip_parts.append(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
                 tooltip = "<br>".join(tooltip_parts)
                 
@@ -7613,6 +7756,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "radio": self.radio_combo.currentText(),
             "path": self.path_combo.currentText(),
             "symbol_table": self.symbol_table_combo.currentText(),
+            "igate_freq": self.igate_freq_edit.text() if hasattr(self, 'igate_freq_edit') else "144.390MHz",
+            "igate_location": self.igate_location_edit.text() if hasattr(self, 'igate_location_edit') else "",
             "symbol_code": self.symbol_code_edit.text(),
             
             # Settings tab - Serial ports
@@ -7657,7 +7802,6 @@ class MainWindow(MonitorsMixin, QMainWindow):
             
             # RX tab layers
             "weather_enabled": self.rx_weather_check.isChecked() if hasattr(self, 'rx_weather_check') else False,
-            "darn_enabled": self.rx_darn_check.isChecked() if hasattr(self, 'rx_darn_check') else False,
             
             # Settings tab - Map tile cache zoom
             "cache_map_zoom": self.cache_map_zoom_slider.value() if hasattr(self, 'cache_map_zoom_slider') else 14,
@@ -7761,6 +7905,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 self.lon_edit.setValue(settings["longitude"])
             if "comment" in settings:
                 self.comment_edit.setText(settings["comment"])
+                if hasattr(self, 'igate_freq_edit'):
+                    self.igate_freq_edit.setText(settings.get("igate_freq", "144.390MHz"))
+                if hasattr(self, 'igate_location_edit'):
+                    self.igate_location_edit.setText(settings.get("igate_location", ""))
             if "radio" in settings:
                 idx = self.radio_combo.findText(settings["radio"])
                 if idx >= 0:
@@ -7917,12 +8065,7 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 self.rx_weather_check.setChecked(settings["weather_enabled"])
                 self.rx_weather_check.blockSignals(False)
             
-            # RX tab layers - DARN
-            if hasattr(self, 'rx_darn_check') and "darn_enabled" in settings:
-                self.rx_darn_check.blockSignals(True)
-                self.rx_darn_check.setChecked(settings["darn_enabled"])
-                self.rx_darn_check.blockSignals(False)
-            
+                
             # Settings tab - Map tile cache zoom
             if hasattr(self, 'cache_map_zoom_slider') and "cache_map_zoom" in settings:
                 self.cache_map_zoom_slider.setValue(settings["cache_map_zoom"])
@@ -8275,10 +8418,6 @@ class MainWindow(MonitorsMixin, QMainWindow):
             layers.append("weather")
             self._toggle_weather_layer(Qt.CheckState.Checked.value)
         
-        # DARN repeaters
-        if hasattr(self, 'rx_darn_check') and self.rx_darn_check.isChecked():
-            layers.append("DARN")
-            self._rx_toggle_darn(Qt.CheckState.Checked.value)
         
         # Earthquakes
         if hasattr(self, 'quake_enabled') and self.quake_enabled.isChecked():

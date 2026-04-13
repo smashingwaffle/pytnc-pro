@@ -270,38 +270,6 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       text-overflow: ellipsis;
     }
     
-    /* DARN emergency repeater marker (red) */
-    .darn-marker {
-      text-align: center;
-    }
-    .darn-marker .darn-icon {
-      font-size: 22px;
-      text-shadow: 0 0 6px rgba(255,0,0,0.8);
-    }
-    .darn-marker .darn-loc {
-      position: absolute;
-      top: 22px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(180,0,0,0.95);
-      color: #fff;
-      font-size: 9px;
-      font-weight: bold;
-      padding: 2px 5px;
-      border-radius: 3px;
-      white-space: nowrap;
-      max-width: 120px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      border: 1px solid #ff6b6b;
-    }
-    
-    /* DARN tooltip */
-    .darn-tooltip {
-      background: rgba(120,0,0,0.95) !important;
-      border: 1px solid #ff6b6b !important;
-      color: #fff !important;
-    }
     
     /* Repeater tooltip */
     .repeater-tooltip {
@@ -448,11 +416,10 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         var popupOpen = false;
         var openPopupMarker = null;
         
-        // Debug: log every map movement with stack trace
-        map.on('moveend', function() {
-          var c = map.getCenter();
-          var stack = new Error().stack.split('\n').slice(2, 5).join(' >> ');
-          console.log('[MAPDBG] MOVEEND center=' + c.lat.toFixed(4) + ',' + c.lng.toFixed(4) + ' zoom=' + map.getZoom() + ' STACK: ' + stack);
+
+        // Click anywhere on map to close popup
+        map.on('click', function() {
+          map.closePopup();
         });
 
         map.on('popupopen', function(e) {
@@ -558,7 +525,7 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
             iconUrl: iconUrl,
             iconSize: [24, 24],
             iconAnchor: [12, 12],
-            popupAnchor: [0, -12]
+            popupAnchor: [0, -14]
           });
         }
         return iconCache[iconUrl];
@@ -694,21 +661,32 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       }
       
       // Pan to station
-      window.panToStation = function(call) {
-        if (!markers[call]) {
-          console.log('[MAPDBG] panToStation: no marker for ' + call);
-          return;
+      // Block unintended programmatic pans — allow zoom and user drag
+      var _allowMapMove = false;
+      var _origSetView = map.setView.bind(map);
+      map.setView = function(center, zoom, options) {
+        if (_allowMapMove) {
+          return _origSetView(center, zoom, options);
         }
+        if (zoom !== undefined && zoom !== map.getZoom()) {
+          return _origSetView(center, zoom, options);
+        }
+        return map;
+      };
+
+      window.panToStation = function(call) {
+        if (!markers[call]) return;
         var ll = markers[call].getLatLng();
         var currentZoom = map.getZoom();
         var targetZoom = currentZoom < 13 ? 14 : currentZoom;
-        console.log('[MAPDBG] panToStation: ' + call + ' ll=' + ll.lat.toFixed(4) + ',' + ll.lng.toFixed(4));
-        map.setView(ll, targetZoom, { animate: false });
-        console.log('[MAPDBG] after setView=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4));
-        setTimeout(function() { console.log('[MAPDBG] 300ms center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 300);
-        setTimeout(function() { console.log('[MAPDBG] 1s center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 1000);
-        setTimeout(function() { console.log('[MAPDBG] 2s center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 2000);
-        setTimeout(function() { console.log('[MAPDBG] 3s center=' + map.getCenter().lat.toFixed(4) + ',' + map.getCenter().lng.toFixed(4)); }, 3000);
+        map.closePopup();
+        _allowMapMove = true;
+        _origSetView(ll, targetZoom, { animate: false });
+        _allowMapMove = false;
+        // QWebEngineView needs extra time to finish rendering after setView
+        setTimeout(function() {
+          if (markers[call]) markers[call].openPopup();
+        }, 200);
       };
 
       // Remove a killed object/item from the map
@@ -840,7 +818,7 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
               bubblingMouseEvents: false
             })
             .addTo(map)
-            .bindPopup(popupHtml, { autoPan: false })
+            .bindPopup(popupHtml, { autoPan: false, keepInView: false })
             .bindTooltip(labelHtml, { 
               permanent: true,
               direction: 'right',
@@ -848,13 +826,16 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
               className: 'callsign-label',
               autoPan: false
             });
-          // Click to toggle popup — no map movement
-          markers[call].on('mouseover', function() { this.openPopup(); });
-          markers[call].on('mouseout', function(e) {
-            var related = e.originalEvent.relatedTarget;
-            if (related && this.getPopup() && this.getPopup().getElement() &&
-                this.getPopup().getElement().contains(related)) return;
-            this.closePopup();
+          // Click icon: toggle popup, no map movement
+          markers[call].off('click');
+          markers[call].on('click', function(e) {
+            L.DomEvent.stopPropagation(e);
+            if (this.isPopupOpen()) {
+              this.closePopup();
+            } else {
+              map.closePopup();
+              this.openPopup();
+            }
           });
           markers[call]._basePopup = basePopup;
         }
@@ -1035,13 +1016,7 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
       // Center map on station
       window.centerOn = function(call) {
         if (markers[call]) {
-          var ll = markers[call].getLatLng();
-          var currentZoom = map.getZoom();
-          var targetZoom = currentZoom < 12 ? 13 : currentZoom;
-          map.flyTo(ll, targetZoom, { animate: true, duration: 0.4 });
-          setTimeout(function() {
-            if (markers[call]) markers[call].openPopup();
-          }, 450);
+          window.panToStation(call);
         }
       };
       
@@ -1134,7 +1109,8 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
               permanent: true,
               direction: 'right',
               offset: [8, 0],
-              className: 'eq-mag-label'
+              className: 'eq-mag-label',
+              autoPan: false
             });
           }
           
@@ -1520,39 +1496,6 @@ def write_map_html(base_dir: Path, http_port: int = 8080) -> Path:
         return true;
       };
       
-      // DARN emergency repeater markers (red)
-      var darnMarkers = [];
-      
-      window.addDarn = function(lat, lon, name, location, tooltip, status) {
-        var safeLocation = escapeHtml(location);
-        var safeTooltip = safeTooltipHtml(tooltip);
-        
-        var statusColor = status === 'Online' ? '#00ff00' : (status === 'Degraded' ? '#ffaa00' : '#ff4444');
-        var darnIcon = L.divIcon({
-          className: 'darn-marker',
-          html: '<div class="darn-icon">🔴</div><div class="darn-loc">' + safeLocation + '</div>',
-          iconSize: [100, 35],
-          iconAnchor: [50, 17]
-        });
-        
-        var marker = L.marker([lat, lon], {icon: darnIcon}).addTo(map);
-        
-        marker.bindTooltip(safeTooltip, {
-          className: 'darn-tooltip'
-        });
-        
-        marker.bindPopup(safeTooltip);
-        
-        darnMarkers.push(marker);
-        return true;
-      };
-      
-      window.clearDarn = function() {
-        darnMarkers.forEach(function(m) {
-          map.removeLayer(m);
-        });
-        darnMarkers = [];
-      };
       
       // Clear all repeaters
       window.clearRepeaters = function() {
