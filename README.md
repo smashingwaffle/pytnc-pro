@@ -28,7 +28,7 @@ A FREE modern, feature-rich APRS transceiver for Windows with real-time mapping,
 - **NASA FIRMS Wildfires** - Active fire detection from satellite data
 - **Air Quality Index (AQI)** - Smoke and pollution monitoring via AirNow
 - **Hospital Locations** - Nearby trauma centers and emergency rooms
-- **DARN Network** - Disaster Amateur Radio Network repeater locations
+
 
 ### 📻 Radio Integration
 - **PTT Control** - Serial port PTT (RTS/DTR)
