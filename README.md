@@ -142,8 +142,6 @@ For full functionality, obtain free API keys:
 ### Layer Toggles (RX Tab)
 
 - 🏥 **Hospitals** - Emergency medical facilities
-- ⚠️ **NOAA** - Weather alerts
-- 🔴 **DARN** - Emergency repeaters
 - 🔥 **Fires** - Active wildfires
 - 🌍 **Quakes** - Recent earthquakes
 - 💨 **AQI** - Air quality index
