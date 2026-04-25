@@ -1,19 +1,30 @@
-# PyTNC Pro v0.1.0-beta Dependencies
+# PyTNC Pro v0.1.7-beta Requirements
+# Install with: pip install -r requirements.txt
 
-# GUI
-PyQt6>=6.4.0
-PyQt6-WebEngine>=6.4.0
+# Qt6 GUI framework
+PyQt6>=6.5.0
+PyQt6-Qt6>=6.5.0
+PyQt6-sip>=13.5.0
+PyQt6-WebEngine>=6.5.0
 
-# Audio Processing
-numpy>=1.21.0
-scipy>=1.7.0
-sounddevice>=0.4.4
+# Audio I/O (TX/RX via soundcard)
+sounddevice>=0.4.6
+numpy>=1.24.0
 
-# Image Processing
-Pillow>=9.0.0
+# Signal processing (AFSK pre-emphasis filter)
+scipy>=1.10.0
 
-# Serial Communication
+# Serial port (PTT control, GPS)
 pyserial>=3.5
 
-# Optional: For building executables
-# pyinstaller>=5.0.0
+# Image processing (APRS symbol icons)
+Pillow>=9.0.0
+
+# Excel file support (locations import)
+openpyxl>=3.1.0
+
+# CM108 GPIO PTT (DigiRig Lite, AllScan URI)
+hid>=1.0.4
+
+# HTTP requests (elevation, weather, earthquake APIs)
+requests>=2.28.0
