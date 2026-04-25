@@ -1,80 +1,88 @@
 # PyTNC Pro
 
-A FREE modern, feature-rich APRS transceiver for Windows with real-time mapping, emergency communications support, and VARA FM integration. The WIKI page is live.
+A **free**, modern APRS transceiver for Windows with real-time mapping, emergency communications support, VARA FM integration, and RF TX/RX via soundcard. Built by a ham, for hams.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
+![Version](https://img.shields.io/badge/Version-0.1.7--beta-orange.svg)
+
+📖 **[Wiki & Documentation](https://github.com/smashingwaffle/pytnc-pro/wiki)**
+
+---
 
 ## Features
 
 ### 📡 APRS Operations
-- **APRS-IS Integration** - Connect to the worldwide APRS Internet System
-- **RF TX/RX** - Transmit and receive over radio via soundcard modem (AFSK 1200 baud)
-- **VARA FM Support** - High-speed digital mode for APRS over VARA FM
-- **Smart Beaconing** - Automatic position beacons with configurable intervals
-- **Full Symbol Support** - All APRS symbols with Hessu icon set
+- **APRS-IS Integration** — Connect to the worldwide APRS Internet System
+- **RF TX/RX** — Transmit and receive over radio via soundcard modem (Bell 202 AFSK 1200 baud)
+- **Pre-emphasis TX** — Improved RF decode rates via Bell 202 pre-emphasis filter
+- **RX + TX IGate** — Full IGate spec compliance, third-party packet unwrapping
+- **VARA FM Support** — High-speed digital APRS over VARA FM modem
+- **SmartBeaconing™** — Adaptive beacon rate based on speed and course change
+- **APRS Objects** — Create and beacon named objects (command posts, nets, events)
+- **Full Symbol Support** — All APRS symbols with Hessu icon set
 
 ### 🗺️ Real-Time Mapping
-- **Live Station Tracking** - See all APRS stations on an interactive map
-- **Clickable Callsigns** - Click any callsign in the feed to pan to their location
-- **QRZ Popups** - Station info with profile photos (requires QRZ subscription)
-- **Trail History** - Track station movement over time
-- **GPU Accelerated** - Smooth 60fps map rendering
+- **Live Station Tracking** — All APRS stations on an interactive Leaflet map
+- **Click to Pan** — Click any callsign in the live feed to center the map on that station
+- **Station Popups** — Device type, elevation, speed, weather, path, timestamp
+- **Trail History** — Track station movement over time
+- **Station Age Fading** — Stations fade as they age (fresh/aging/old)
+- **Show Last Filter** — Filter map by time: 15min → 24hr
+- **Offline Map Cache** — Download tiles for offline operation
+- **GPU Accelerated** — Smooth rendering via WebGL
 
-### 🚨 Emergency Communications (EmComm)
-- **NOAA Weather Alerts** - Real-time NWS warnings and watches
-- **USGS Earthquakes** - Live earthquake data with magnitude filtering
-- **NASA FIRMS Wildfires** - Active fire detection from satellite data
-- **Air Quality Index (AQI)** - Smoke and pollution monitoring via AirNow
-- **Hospital Locations** - Nearby trauma centers and emergency rooms
+### 🚨 Emergency Communications
+- **NOAA Weather Alerts** — Real-time NWS warnings and watches
+- **USGS Earthquakes** — Live earthquake data with magnitude and radius filtering
+- **NASA FIRMS Wildfires** — Active fire detection from satellite
+- **Air Quality Index** — Smoke and pollution monitoring via AirNow
+- **Hospital Locations** — Nearby trauma centers and emergency rooms
+- **Custom Locations** — Load CSV/Excel location files onto the map
 
+### ⛰️ GPS & Elevation
+- **Serial GPS** — NMEA-compatible GPS for automatic position updates
+- **Auto-Elevation** — Fetches your elevation from Open-Meteo on GPS fix
+- **Elevation in Beacons** — `/A=` altitude appended to all RF and APRS-IS packets
 
 ### 📻 Radio Integration
-- **PTT Control** - Serial port PTT (RTS/DTR)
-- **CAT Control** - Rig frequency/mode control (Yaesu, Icom, Kenwood)
-- **GPS Support** - Serial GPS for automatic position updates
-- **Audio Device Selection** - Independent TX/RX audio routing
+- **PTT Control** — RTS/DTR via USB-to-serial adapter
+- **CM108 GPIO PTT** — DigiRig Lite, AllScan URI and similar USB audio interfaces
+- **Audio Device Selection** — Independent TX/RX audio routing
+- **30-second Dedup** — Duplicate packet suppression matching aprsc/Dire Wolf standard
 
-Future feature ::### 💬 Messaging
-- **APRS Messaging** - Send and receive APRS messages
-- **Message Acknowledgment** - Automatic retry with ACK/REJ
-- **Conversation History** - Persistent chat logs
+---
 
-## Screenshots
+## Supported Hardware
 
-*Coming soon*
+See the **[Supported Hardware Wiki page](https://github.com/smashingwaffle/pytnc-pro/wiki)** for a full list.
+
+| Type | Examples |
+|---|---|
+| Sound card interface | SignaLink USB, DigiRig Mobile, DigiRig Lite, AllScan URI/URI160/ANH85 |
+| PTT method | RTS/DTR serial, CM108 GPIO |
+| GPS | Any NMEA serial/USB GPS |
+| Radio | Any VHF/UHF radio with audio in/out |
+
+---
 
 ## Installation
 
 ### Prerequisites
 - Windows 10/11
 - Python 3.10 or higher
-- A soundcard interface for RF operations (SignaLink, Digirig, etc.)
 
 ### Quick Start
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/smashingwaffle/pytnc-pro.git
-   cd pytnc-pro
-   ```
-
-2. **Create virtual environment**
-   ```bash
-   python -m venv .venv
-   .venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Run PyTNC Pro**
-   ```bash
-   python main.py
-   ```
+```bash
+git clone https://github.com/smashingwaffle/pytnc-pro.git
+cd pytnc-pro
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
 
 ### Dependencies
 
@@ -85,158 +93,102 @@ pyserial>=3.5
 numpy>=1.24.0
 scipy>=1.10.0
 sounddevice>=0.4.6
+Pillow>=9.0.0
+openpyxl>=3.1.0
 requests>=2.28.0
+hid>=1.0.4
 ```
+
+---
 
 ## Configuration
 
-### First Run Setup
+### First Run
+1. **Settings tab** — Enter callsign, SSID, location, audio devices, PTT port
+2. **APRS tab** — Set symbol, comment, path, beacon interval
+3. **IGate tab** — Enable RX/TX IGate, set frequency and location description
+4. **APRS-IS** — Server: `rotate.aprs2.net`, Port: `14580`, enter passcode
 
-1. **Station Settings** (Settings tab)
-   - Enter your callsign and SSID
-   - Set your location (manual coordinates or GPS)
-   - Select your APRS symbol
+### Optional API Keys
 
-2. **Audio Setup**
-   - Select TX and RX audio devices
-   - Adjust audio levels
-
-3. **Serial Ports** (if using RF)
-   - Configure PTT port and method (RTS/DTR)
-   - Configure GPS port if available
-
-4. **APRS-IS** (for internet gateway)
-   - Server: `noam.aprs2.net` (North America) or `rotate.aprs2.net`
-   - Port: `14580`
-   - Enter your APRS-IS passcode
-
-### API Keys (Optional)
-
-For full functionality, obtain free API keys:
-
-| Feature | API | Get Key |
-|---------|-----|---------|
+| Feature | Provider | Link |
+|---|---|---|
 | Wildfires | NASA FIRMS | [firms.modaps.eosdis.nasa.gov](https://firms.modaps.eosdis.nasa.gov/api/area/) |
 | Air Quality | AirNow | [docs.airnowapi.org](https://docs.airnowapi.org/) |
-| QRZ Lookups | QRZ.com | [qrz.com/page/xml_data.html](https://www.qrz.com/page/xml_data.html) |
 
-## Usage
-
-### Tabs Overview
-
-| Tab | Purpose |
-|-----|---------|
-| **RX** | Main map view with live feed and layer toggles |
-| **Beacon** | Configure and send position beacons |
-| **Message** | APRS messaging interface |
-| **VARA FM** | VARA FM modem control and chat |
-| **Settings** | All configuration options |
-
-### Map Controls
-
-- **Scroll** - Zoom in/out
-- **Drag** - Pan the map
-- **Click Station** - View popup with station details
-- **Click Callsign** (in feed) - Pan to station on map
-
-### Layer Toggles (RX Tab)
-
-- 🏥 **Hospitals** - Emergency medical facilities
-- 🔥 **Fires** - Active wildfires
-- 🌍 **Quakes** - Recent earthquakes
-- 💨 **AQI** - Air quality index
+---
 
 ## VARA FM Setup
 
 1. Download and install [VARA FM](https://rosmodem.wordpress.com/)
-2. Configure VARA FM audio settings
-3. In PyTNC Pro Settings, set VARA FM ports:
-   - Command Port: `8300`
-   - Data Port: `8301`
-   - KISS Port: `8100`
-4. Click "Connect" in the VARA FM tab
+2. In PyTNC Pro → VARA FM tab, set ports: Command `8300`, Data `8301`, KISS `8100`
+3. Click Connect
 
-## Offline Operation
-
-PyTNC Pro supports offline map caching:
-
-1. Go to **Settings** → **Offline Cache**
-2. Set cache radius and zoom level
-3. Click **Cache Now** to download tiles
-4. Maps will work without internet connection
+---
 
 ## File Structure
 
 ```
 pytnc-pro/
-├── main.py              # Main application
-├── aprs_parser.py       # APRS packet parser
-├── pytnc_config.py      # Configuration management
-├── requirements.txt     # Python dependencies
+├── main.py                  # Main application
+├── aprs_parser.py           # APRS packet parser
+├── pytnc_config.py          # Configuration and device database
+├── requirements.txt         # Python dependencies
 ├── tnc/
-│   ├── map.py          # Map HTML generator
-│   ├── afsk.py         # AFSK modem
-│   ├── ax25.py         # AX.25 protocol
-│   └── hdlc.py         # HDLC framing
-├── hessu-symbols/       # APRS symbol icons
-│   ├── primary/        # Primary table (/)
-│   └── secondary/      # Secondary table (\)
-└── tile_cache/         # Cached map tiles
+│   ├── map.py              # Leaflet map generator
+│   ├── monitors.py         # Overlay monitors (weather, quakes, fires...)
+│   ├── igate.py            # IGate logic
+│   ├── aprs_is.py          # APRS-IS connection
+│   ├── vara.py             # VARA FM interface
+│   ├── ptt.py              # PTT control
+│   └── audio/
+│       └── afsk.py         # Bell 202 AFSK modulator with pre-emphasis
+├── aprs_symbols_48/         # APRS symbol icons (Hessu set)
+└── aprs_map.html            # Generated map HTML
 ```
-
-## Troubleshooting
-
-### Map Performance Issues
-
-If the map is slow or choppy:
-
-1. **NVIDIA GPU Users**: Add Python to NVIDIA Control Panel
-   - NVIDIA Control Panel → Manage 3D Settings → Program Settings
-   - Add your `.venv\Scripts\python.exe`
-   - Set to "High-performance NVIDIA processor"
-
-2. **Delete cached HTML**: Delete `aprs_map.html` from your project folder and restart
-
-### No Audio Output
-
-- Check Windows sound settings
-- Verify correct audio device selected in Settings
-- Test with a lower audio level first
-
-### APRS-IS Connection Failed
-
-- Verify internet connection
-- Check firewall settings (port 14580)
-- Ensure callsign and passcode are correct
-
-### GPS Not Working
-
-- Check COM port selection
-- Verify GPS baud rate (usually 4800 or 9600)
-- Ensure GPS has clear sky view for fix
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Hessu/OH7LZB](https://github.com/hessu) - APRS symbol icons
-- [APRS.fi](https://aprs.fi) - Inspiration and reference
-- [Leaflet](https://leafletjs.com/) - Map library
-- [OpenStreetMap](https://www.openstreetmap.org/) - Map tiles
-- [VARA](https://rosmodem.wordpress.com/) - VARA FM modem
-
-## Contact
-
-- GitHub: [@smashingwaffle](https://github.com/smashingwaffle)
-- QRZ: Look me up!
 
 ---
 
-73 de PyTNC Pro Team
-Stefaan Desmedt Los Angeles/Torhout Belgium
+## Troubleshooting
+
+### RF Decode Issues
+- Ensure TX audio level isn't clipping (aim for 40-50% in Settings)
+- Check PTT is triggering (green LED on interface)
+- Verify correct audio device selected for TX
+
+### Map Performance
+NVIDIA GPU users: Add Python to NVIDIA Control Panel → High-performance NVIDIA processor
+
+### APRS-IS Connection Failed
+- Check port 14580 isn't blocked by firewall
+- Verify callsign and passcode are correct
+
+### GPS Not Working
+- Check COM port and baud rate (usually 4800)
+- GPS needs clear sky view for fix
+
+---
+
+## Contributing
+
+Pull requests welcome. Please open an issue first for major changes.
+
+---
+
+## Acknowledgments
+
+- [Hessu/OH7LZB](https://github.com/hessu) — APRS symbol icons
+- [Leaflet](https://leafletjs.com/) — Map library
+- [OpenStreetMap](https://www.openstreetmap.org/) — Map tiles
+- [VARA](https://rosmodem.wordpress.com/) — VARA FM modem
+- [Open-Meteo](https://open-meteo.com/) — Elevation API
+- [APRS.fi](https://aprs.fi) — Reference and inspiration
+
+## License
+
+MIT License — see [LICENSE](LICENSE)
+
+---
+
+73 de KO6IKR 📻  
+Stefaan Desmedt — Los Angeles CA / Torhout Belgium
