@@ -12,7 +12,7 @@ Features:
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.6-beta"
+__version__ = "0.1.7-beta"
 VERSION = __version__
 
 import sys
@@ -25,7 +25,7 @@ import threading
 import http.server
 import socket
 import socketserver
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 from functools import partial
@@ -1812,8 +1812,11 @@ class MainWindow(MonitorsMixin, QMainWindow):
         beacon_grp.setStyleSheet(self._group_style())
         beacon_layout = QVBoxLayout(beacon_grp)
         beacon_layout.setSpacing(6)
-        
-        # APRS-IS button
+
+        # Both buttons side by side
+        send_btn_row = QHBoxLayout()
+        send_btn_row.setSpacing(6)
+
         self.beacon_is_btn = QPushButton("🌐 Send via APRS-IS")
         self.beacon_is_btn.setMinimumHeight(40)
         self.beacon_is_btn.setToolTip("Send beacon via internet (APRS-IS)")
@@ -1821,11 +1824,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #1565c0, stop:1 #0d47a1);
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                border: 2px solid #42a5f5;
-                border-radius: 6px;
+                color: white; font-weight: bold; font-size: 12px;
+                border: 2px solid #42a5f5; border-radius: 6px;
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -1833,9 +1833,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
             }
         """)
         self.beacon_is_btn.clicked.connect(self._send_beacon_aprs_is)
-        beacon_layout.addWidget(self.beacon_is_btn)
-        
-        # RF button
+        send_btn_row.addWidget(self.beacon_is_btn)
+
         self.beacon_btn = QPushButton("📡 Send via RF")
         self.beacon_btn.setMinimumHeight(40)
         self.beacon_btn.setToolTip("Send beacon via audio/RF")
@@ -1843,11 +1842,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #d32f2f, stop:1 #b71c1c);
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                border: 2px solid #ef5350;
-                border-radius: 6px;
+                color: white; font-weight: bold; font-size: 12px;
+                border: 2px solid #ef5350; border-radius: 6px;
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -1855,48 +1851,45 @@ class MainWindow(MonitorsMixin, QMainWindow):
             }
         """)
         self.beacon_btn.clicked.connect(self.send_beacon)
-        beacon_layout.addWidget(self.beacon_btn)
-        
+        send_btn_row.addWidget(self.beacon_btn)
+        beacon_layout.addLayout(send_btn_row)
+
         left_layout.addWidget(beacon_grp)
-        
+
         # Auto-Beacon Group
         auto_beacon_grp = QGroupBox("⏱️ Auto-Beacon")
         auto_beacon_grp.setStyleSheet(self._group_style())
         auto_layout = QGridLayout(auto_beacon_grp)
         auto_layout.setSpacing(6)
-        
+
         # Enable checkbox
         self.auto_beacon_enabled = QCheckBox("Enable auto-beacon")
         self.auto_beacon_enabled.setToolTip("Automatically send beacon at regular intervals")
         self.auto_beacon_enabled.stateChanged.connect(self._toggle_auto_beacon)
         auto_layout.addWidget(self.auto_beacon_enabled, 0, 0, 1, 2)
-        
-        # Interval
+
+        # Interval and Mode on same row
         auto_layout.addWidget(QLabel("Interval:"), 1, 0)
-        interval_layout = QHBoxLayout()
         self.auto_beacon_interval = QSpinBox()
         self.auto_beacon_interval.setRange(1, 60)
         self.auto_beacon_interval.setValue(10)
         self.auto_beacon_interval.setSuffix(" min")
         self.auto_beacon_interval.setToolTip("Beacon interval in minutes")
         self.auto_beacon_interval.valueChanged.connect(self._update_auto_beacon_interval)
-        interval_layout.addWidget(self.auto_beacon_interval)
-        interval_layout.addStretch()
-        auto_layout.addLayout(interval_layout, 1, 1)
-        
-        # Mode (RF, APRS-IS, or Both)
-        auto_layout.addWidget(QLabel("Mode:"), 2, 0)
+        auto_layout.addWidget(self.auto_beacon_interval, 1, 1)
+
+        auto_layout.addWidget(QLabel("Mode:"), 1, 2)
         self.auto_beacon_mode = QComboBox()
-        self.auto_beacon_mode.addItem("APRS-IS only", "is")
+        self.auto_beacon_mode.addItem("IS only", "is")
         self.auto_beacon_mode.addItem("RF only", "rf")
-        self.auto_beacon_mode.addItem("Both RF + APRS-IS", "both")
+        self.auto_beacon_mode.addItem("Both", "both")
         self.auto_beacon_mode.setToolTip("How to send auto-beacons")
-        auto_layout.addWidget(self.auto_beacon_mode, 2, 1)
-        
+        auto_layout.addWidget(self.auto_beacon_mode, 1, 3)
+
         # Status/countdown label
         self.auto_beacon_status = QLabel("Auto-beacon: Off")
         self.auto_beacon_status.setStyleSheet("color: #607d8b;")
-        auto_layout.addWidget(self.auto_beacon_status, 3, 0, 1, 2)
+        auto_layout.addWidget(self.auto_beacon_status, 2, 0, 1, 4)
 
         # SmartBeaconing
         self.smart_beacon_enabled = QCheckBox("SmartBeaconing™ (GPS)")
@@ -1906,17 +1899,35 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "Requires GPS fix."
         )
         self.smart_beacon_enabled.setStyleSheet("color: #80deea;")
-        auto_layout.addWidget(self.smart_beacon_enabled, 4, 0, 1, 2)
+        auto_layout.addWidget(self.smart_beacon_enabled, 3, 0, 1, 4)
 
         left_layout.addWidget(auto_beacon_grp)
-        
+
         # Initialize auto-beacon timer
         self.auto_beacon_timer = QTimer()
         self.auto_beacon_timer.timeout.connect(self._auto_beacon_tick)
         self.auto_beacon_countdown = 0
-        
+
+        # ── APRS Objects button (opens dedicated window) ─────────────────────
+        obj_btn = QPushButton("📌 APRS Objects...")
+        obj_btn.setToolTip("Manage APRS objects — create, edit, beacon")
+        obj_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a2a3a; color: #80cbc4;
+                border: 1px solid #80cbc4; border-radius: 4px;
+                padding: 6px; font-size: 12px;
+            }
+            QPushButton:hover { background: #1e3a5f; }
+        """)
+        obj_btn.clicked.connect(self._open_objects_window)
+        left_layout.addWidget(obj_btn)
+
+        # Initialize objects store
+        self.aprs_objects = []  # list of dicts
+        self._objects_window = None  # floating window reference
+
         left_layout.addStretch()
-        
+
         settings_layout.addWidget(left_panel, 1)
         
         # Right panel - Symbol picker and TX Log
@@ -3477,11 +3488,9 @@ class MainWindow(MonitorsMixin, QMainWindow):
             # Build third-party info field: }FROMCALL>TOCALL,TCPIP,IGATECALL*:data
             tp_info = f"}}{src}>{inner_path}:{payload}"
 
-            if hasattr(self, '_queue_rf_packet'):
-                self._queue_rf_packet(my_full, "APPR01", "WIDE1-1", tp_info)
-            else:
-                self._igate_log_entry("⚠️ TX Gate: no RF TX method available", "#ef5350")
-                return
+            # Third-party packet TX not yet implemented
+            self._igate_log_entry("⚠️ TX Gate: RF TX not available", "#ef5350")
+            return
 
             self.igate_tx_count += 1
             self.igate_tx_count_lbl.setText(str(self.igate_tx_count))
@@ -5327,6 +5336,374 @@ class MainWindow(MonitorsMixin, QMainWindow):
             self.auto_beacon_countdown = value * 60
             self._log(f"⏱️ Auto-beacon interval changed to {value} minutes")
     
+    # =========================================================================
+    # APRS Objects
+    # =========================================================================
+
+    def _open_objects_window(self):
+        """Open the APRS Objects floating window."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
+        if self._objects_window and self._objects_window.isVisible():
+            self._objects_window.raise_()
+            self._objects_window.activateWindow()
+            return
+
+        win = QDialog(self)
+        win.setWindowTitle("📌 APRS Objects")
+        win.setMinimumSize(480, 320)
+        win.setStyleSheet("background:#0a1628; color:#e0e0e0;")
+        self._objects_window = win
+
+        layout = QVBoxLayout(win)
+        layout.setSpacing(8)
+
+        # Object list
+        self.object_list = QListWidget()
+        self.object_list.setStyleSheet("""
+            QListWidget {
+                background: #0d1f33; color: #e0e0e0;
+                border: 1px solid #1e3a5f; border-radius: 4px;
+                font-family: Consolas; font-size: 11px;
+            }
+            QListWidget::item:selected { background: #1565c0; }
+            QListWidget::item:hover { background: #1a3a5f; }
+        """)
+        layout.addWidget(self.object_list)
+        self._object_refresh_list()
+
+        # Edit buttons row
+        btn_row = QHBoxLayout()
+        for label, color, slot in [
+            ("➕ New Object", "#69f0ae", self._object_add),
+            ("✏️ Edit",       "#42a5f5", self._object_edit),
+            ("🗑️ Delete",     "#ef5350", self._object_delete),
+        ]:
+            btn = QPushButton(label)
+            btn.setStyleSheet(f"""
+                QPushButton {{ background:#0d2137; color:{color}; border:1px solid {color};
+                    border-radius:4px; padding:5px 10px; font-size:11px; }}
+                QPushButton:hover {{ background:#1a3a5f; }}
+            """)
+            btn.clicked.connect(slot)
+            btn_row.addWidget(btn)
+        layout.addLayout(btn_row)
+
+        # Beacon buttons row
+        tx_row = QHBoxLayout()
+        is_btn = QPushButton("🌐 Beacon via APRS-IS")
+        is_btn.setMinimumHeight(36)
+        is_btn.setStyleSheet("""
+            QPushButton { background:#0d47a1; color:#fff; border:2px solid #42a5f5;
+                border-radius:5px; font-size:12px; font-weight:bold; }
+            QPushButton:hover { background:#1565c0; }
+        """)
+        is_btn.clicked.connect(self._object_beacon_is)
+        tx_row.addWidget(is_btn)
+
+        rf_btn = QPushButton("📻 Beacon via RF")
+        rf_btn.setMinimumHeight(36)
+        rf_btn.setStyleSheet("""
+            QPushButton { background:#b71c1c; color:#fff; border:2px solid #ef5350;
+                border-radius:5px; font-size:12px; font-weight:bold; }
+            QPushButton:hover { background:#d32f2f; }
+        """)
+        rf_btn.clicked.connect(self._object_beacon_rf)
+        tx_row.addWidget(rf_btn)
+        layout.addLayout(tx_row)
+
+        win.show()
+
+    def _object_refresh_list(self):
+        if not hasattr(self, 'object_list') or self.object_list is None:
+            return
+        self.object_list.clear()
+        for obj in self.aprs_objects:
+            sym = f"{obj['symbol_table']}{obj['symbol_code']}"
+            self.object_list.addItem(
+                f"📌 {obj['name']:<9}  {sym}  {obj['comment'][:35]}"
+            )
+
+    def _object_add(self):
+        self._object_dialog()
+
+    def _object_edit(self):
+        row = self.object_list.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select Object", "Select an object to edit.")
+            return
+        self._object_dialog(row)
+
+    def _object_delete(self):
+        row = self.object_list.currentRow()
+        if row < 0:
+            return
+        name = self.aprs_objects[row]['name']
+        if QMessageBox.question(self, "Delete Object", f"Delete object '{name}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            del self.aprs_objects[row]
+            self._object_refresh_list()
+
+    def _object_dialog(self, edit_row: int = -1):
+        """Show dialog to create or edit an APRS object."""
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox
+        existing = self.aprs_objects[edit_row] if edit_row >= 0 else {}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("APRS Object" if edit_row < 0 else "Edit APRS Object")
+        dlg.setMinimumWidth(380)
+        dlg.setStyleSheet("background:#0a1628; color:#e0e0e0;")
+        form = QFormLayout(dlg)
+        form.setSpacing(10)
+
+        lbl_style = "color:#80cbc4;"
+        edit_style = "background:#0d2137; color:#ffd54f; border:1px solid #1e3a5f; border-radius:4px; padding:3px 6px;"
+
+        name_edit = QLineEdit(existing.get('name', ''))
+        name_edit.setMaxLength(9)
+        name_edit.setPlaceholderText("Max 9 chars, e.g. CMD-POST")
+        name_edit.setStyleSheet(edit_style)
+        form.addRow(QLabel("Name (9 chars):"), name_edit)
+
+        lat_edit = QLineEdit(str(existing.get('lat', self.lat_edit.value())))
+        lat_edit.setStyleSheet(edit_style)
+        form.addRow(QLabel("Latitude:"), lat_edit)
+
+        lon_edit = QLineEdit(str(existing.get('lon', self.lon_edit.value())))
+        lon_edit.setStyleSheet(edit_style)
+        form.addRow(QLabel("Longitude:"), lon_edit)
+
+        sym_table = QLineEdit(existing.get('symbol_table', '/'))
+        sym_table.setMaxLength(1)
+        sym_table.setFixedWidth(40)
+        sym_table.setStyleSheet(edit_style)
+        form.addRow(QLabel("Symbol Table (/ or \\):"), sym_table)
+
+        sym_code = QLineEdit(existing.get('symbol_code', '-'))
+        sym_code.setMaxLength(1)
+        sym_code.setFixedWidth(40)
+        sym_code.setStyleSheet(edit_style)
+        form.addRow(QLabel("Symbol Code:"), sym_code)
+
+        comment_edit = QLineEdit(existing.get('comment', ''))
+        comment_edit.setMaxLength(43)
+        comment_edit.setPlaceholderText("Object description")
+        comment_edit.setStyleSheet(edit_style)
+        form.addRow(QLabel("Comment:"), comment_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.setStyleSheet("QPushButton { background:#1e3a5f; color:#fff; border-radius:4px; padding:4px 12px; }")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name = name_edit.text().strip()[:9]
+        if not name:
+            QMessageBox.warning(self, "Invalid", "Object name is required.")
+            return
+        try:
+            lat = float(lat_edit.text())
+            lon = float(lon_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid", "Latitude and longitude must be numbers.")
+            return
+
+        obj = {
+            'name': name,
+            'lat': lat,
+            'lon': lon,
+            'symbol_table': sym_table.text() or '/',
+            'symbol_code': sym_code.text() or '-',
+            'comment': comment_edit.text().strip(),
+        }
+
+        if edit_row >= 0:
+            self.aprs_objects[edit_row] = obj
+        else:
+            self.aprs_objects.append(obj)
+        self._object_refresh_list()
+
+    def _build_object_packet(self, obj: dict) -> str:
+        """Build APRS object packet string per spec."""
+        from datetime import datetime
+        name = obj['name'].ljust(9)[:9]
+        lat = obj['lat']
+        lon = obj['lon']
+        lat_deg = int(abs(lat))
+        lat_min = (abs(lat) - lat_deg) * 60
+        lat_dir = 'N' if lat >= 0 else 'S'
+        lon_deg = int(abs(lon))
+        lon_min = (abs(lon) - lon_deg) * 60
+        lon_dir = 'E' if lon >= 0 else 'W'
+        ts = datetime.now(timezone.utc).strftime('%d%H%Mz')
+        sym_t = obj['symbol_table']
+        sym_c = obj['symbol_code']
+        comment = obj['comment'][:43]
+        # Object format: ;NAME_____*DDHHMMzDDMM.MMNsSSSMM.MMs
+        pos = f";{name}*{ts}{lat_deg:02d}{lat_min:05.2f}{lat_dir}{sym_t}{lon_deg:03d}{lon_min:05.2f}{lon_dir}{sym_c}{comment}"
+        return pos
+
+    def _object_beacon_is(self):
+        if not hasattr(self, 'object_list') or self.object_list is None:
+            return
+        row = self.object_list.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select Object", "Select an object to beacon.")
+            return
+        if not self.aprs_is_running or not self.aprs_is_socket:
+            self._log("❌ APRS-IS not connected!")
+            if hasattr(self, 'preset_log'):
+                self.preset_log.append("<span style='color:#ef5350'>❌ APRS-IS not connected!</span>")
+            return
+        obj = self.aprs_objects[row]
+        callsign = self.callsign_edit.text().strip().upper()
+        ssid = self.ssid_combo.currentData()
+        full_call = f"{callsign}-{ssid}" if ssid > 0 else callsign
+        pos = self._build_object_packet(obj)
+        packet = f"{full_call}>APPR01,TCPIP*:{pos}\r\n"
+        try:
+            self.aprs_is_socket.send(packet.encode())
+            self._log(f"📌 Object '{obj['name']}' beaconed via APRS-IS")
+            self._log(f"📤 Sending: {packet.strip()}")
+            if hasattr(self, 'preset_log'):
+                _ts = datetime.now().strftime('%H:%M:%S')
+                self.preset_log.append(f"<br><span style='color:#00d4ff'>📌 [{_ts}] Object beacon via APRS-IS</span>")
+                self.preset_log.append(f"   Object: <span style='color:#ffd54f'>{obj['name']}</span>")
+                self.preset_log.append(f"   From: <span style='color:#ffd54f'>{full_call}</span>")
+                self.preset_log.append(f"   Packet: <span style='color:#80deea'>{pos}</span>")
+        except Exception as e:
+            self._log(f"❌ Object beacon failed: {e}")
+
+    def _object_beacon_rf(self):
+        if not hasattr(self, 'object_list') or self.object_list is None:
+            return
+        row = self.object_list.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select Object", "Select an object to beacon.")
+            return
+        obj = self.aprs_objects[row]
+
+        # Build the object info string directly
+        pos = self._build_object_packet(obj)
+        callsign = self.callsign_edit.text().strip().upper()
+        ssid = self.ssid_combo.currentData()
+        full_call = f"{callsign}-{ssid}" if ssid > 0 else callsign
+        path_str = self.path_combo.currentText().strip()
+
+        # Parse path
+        path_list = []
+        if path_str and path_str != "DIRECT":
+            for p in path_str.split(","):
+                p = p.strip()
+                if "-" in p:
+                    pcall, pssid = p.rsplit("-", 1)
+                    path_list.append((pcall, int(pssid)))
+                else:
+                    path_list.append((p, 0))
+
+        # Use send_beacon's full TX infrastructure via _transmit_rf_info
+        self._transmit_rf_info(callsign, ssid, path_list, path_str, pos, obj['name'])
+
+    def _transmit_rf_info(self, callsign, ssid, path_list, path_str, info, label="Packet"):
+        """Shared RF transmit logic used by beacon and objects."""
+        if not HAS_SOUNDDEVICE:
+            QMessageBox.warning(self, "RF Disabled", "sounddevice not installed.")
+            return
+
+        # Auto-connect PTT
+        if not self.ptt_serial or not self.ptt_serial.is_open:
+            if self.ptt_serial:
+                try:
+                    self.ptt_serial.close()
+                except Exception:
+                    pass
+                self.ptt_serial = None
+            ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None
+            if ptt_port:
+                try:
+                    self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
+                    self._set_ptt(False)
+                    self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
+                    self._update_tx_status()
+                except serial.SerialException as e:
+                    self.ptt_serial = None
+                    QMessageBox.warning(self, "PTT Connection Failed", f"Could not open {ptt_port}:\n{e}")
+                    return
+            else:
+                QMessageBox.warning(self, "PTT Not Configured", "Configure PTT port in Settings tab first")
+                return
+
+        tx_device = self.settings_tx_audio_combo.currentData() if hasattr(self, 'settings_tx_audio_combo') else None
+        if tx_device is None:
+            QMessageBox.warning(self, "No TX Audio Device", "Select TX audio output device in Settings tab first")
+            return
+
+        tx_level_pct = self.settings_tx_level.value() if hasattr(self, 'settings_tx_level') else 47
+
+        full_call = f"{callsign}-{ssid}" if ssid > 0 else callsign
+        _ts = datetime.now().strftime('%H:%M:%S')
+        self.preset_log.append(f"<br><span style='color:#64b5f6'>📌 [{_ts}] Transmitting object: {label}...</span>")
+        self.preset_log.append(f"   From: <span style='color:#ffd54f'>{full_call}</span>")
+        self.preset_log.append(f"   Path: <span style='color:#ce93d8'>{path_str}</span>")
+        self.preset_log.append(f"   Info: <span style='color:#80deea'>{info}</span>")
+        self._log(f"📌 Object RF TX: {full_call}>{path_str}:{info}")
+        self.tx_in_progress = True
+
+        try:
+            packet_data = APRSPacketBuilder.build_ui_packet(
+                src_call=callsign, src_ssid=ssid,
+                dst_call="APPR01", dst_ssid=0,
+                path=path_list, info=info
+            )
+            fcs = APRSPacketBuilder.compute_fcs(packet_data)
+            full_packet = packet_data + bytes([fcs & 0xFF, (fcs >> 8) & 0xFF])
+
+            modulator = AFSKModulator(TX_SAMPLE_RATE)
+            audio = modulator.generate_packet_audio(full_packet, preamble_flags=60, postamble_flags=10)
+            silence = np.zeros(int(TX_SAMPLE_RATE * 0.03), dtype=np.float32)
+            audio = np.concatenate([silence, audio, silence])
+            audio = apply_cosine_ramp(audio, TX_SAMPLE_RATE, ramp_ms=5.0)
+            tx_level = tx_level_pct / 100.0
+            audio = audio * tx_level
+
+            TX_LEAD_IN_MS = 700
+            TX_TAIL_MS = 200
+
+            def _do_tx():
+                import time
+                try:
+                    device_info = sd.query_devices(tx_device)
+                    sr = int(device_info.get('default_samplerate', TX_SAMPLE_RATE))
+                    if sr != TX_SAMPLE_RATE:
+                        import scipy.signal as sig
+                        audio_r = sig.resample_poly(audio, sr, TX_SAMPLE_RATE).astype(np.float32)
+                    else:
+                        audio_r = audio
+                    self.preset_log.append(f"   🔴 PTT ON")
+                    self._set_ptt(True)
+                    time.sleep(TX_LEAD_IN_MS / 1000.0)
+                    sd.play(audio_r, sr, device=tx_device)
+                    sd.wait()
+                    time.sleep(TX_TAIL_MS / 1000.0)
+                    self._set_ptt(False)
+                    self.preset_log.append(f"   ⚪ PTT OFF")
+                    self._log(f"✅ Object '{label}' transmitted!")
+                    self.preset_log.append(f"   ✅ Object transmitted!")
+                except Exception as e:
+                    self._set_ptt(False)
+                    self._log(f"❌ Object RF TX failed: {e}")
+                finally:
+                    self.tx_in_progress = False
+
+            import threading
+            threading.Thread(target=_do_tx, daemon=True).start()
+
+        except Exception as e:
+            self.tx_in_progress = False
+            self._log(f"❌ Object RF beacon failed: {e}")
+
     def _auto_beacon_tick(self):
         """Called every second — handles both fixed-interval and SmartBeaconing."""
         import math, time as _time
@@ -6706,6 +7083,19 @@ class MainWindow(MonitorsMixin, QMainWindow):
             if '>' not in line or ':' not in line:
                 return
 
+            # Duplicate suppression — shared 30s dedup with RF handler
+            # Suppresses same packet arriving via multiple paths/igates
+            try:
+                _src_tmp = line.split('>')[0].strip()
+                _payload_tmp = line.split(':', 1)[1].strip()
+                _dedup_key = (_src_tmp, _payload_tmp)
+                _now = time.time()
+                if _now - self.dedup.get(_dedup_key, 0) < 30:
+                    return
+                self.dedup[_dedup_key] = _now
+            except Exception:
+                pass
+
             # TX IGate: attempt to gate this IS packet to RF
             if self.igate_tx_enabled:
                 self._gate_packet_to_rf(line)
@@ -7478,10 +7868,7 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         # Get TX level from Settings
         tx_level_pct = self.settings_tx_level.value() if hasattr(self, 'settings_tx_level') else 10
-        
-        # Save settings when beacon is attempted
-        self.save_settings()
-        
+
         # Format position for APRS
         lat_deg = int(abs(lat))
         lat_min = (abs(lat) - lat_deg) * 60
@@ -7757,6 +8144,7 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "path": self.path_combo.currentText(),
             "symbol_table": self.symbol_table_combo.currentText(),
             "igate_freq": self.igate_freq_edit.text() if hasattr(self, 'igate_freq_edit') else "144.390MHz",
+            "aprs_objects": self.aprs_objects if hasattr(self, 'aprs_objects') else [],
             "igate_location": self.igate_location_edit.text() if hasattr(self, 'igate_location_edit') else "",
             "symbol_code": self.symbol_code_edit.text(),
             
@@ -7909,6 +8297,9 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     self.igate_freq_edit.setText(settings.get("igate_freq", "144.390MHz"))
                 if hasattr(self, 'igate_location_edit'):
                     self.igate_location_edit.setText(settings.get("igate_location", ""))
+                if "aprs_objects" in settings:
+                    self.aprs_objects = settings["aprs_objects"]
+                    self._object_refresh_list()
             if "radio" in settings:
                 idx = self.radio_combo.findText(settings["radio"])
                 if idx >= 0:
@@ -8516,11 +8907,15 @@ class MainWindow(MonitorsMixin, QMainWindow):
         #  of 0xff characters" — WB2OSZ Understanding APRS Packets s5.10
         info = info.replace('\xff', '').replace('\x00', '').rstrip('\r\n')
         
-        key = (src, dst, via, info)
+        key = (src, info)  # Dedup across RF and APRS-IS (ignore path/via)
         now = time.time()
-        if now - self.dedup.get(key, 0) < 1.5:
+        if now - self.dedup.get(key, 0) < 30:
             return
         self.dedup[key] = now
+        # Prune old RF dedup entries
+        if len(self.dedup) > 500:
+            cutoff = now - 60
+            self.dedup = {k: v for k, v in self.dedup.items() if v > cutoff}
 
         # Track this station as RF-heard (for TX IGate eligibility)
         if hasattr(self, 'igate_rf_heard'):
