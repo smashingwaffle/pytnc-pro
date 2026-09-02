@@ -12,7 +12,7 @@ Features:
 - EmComm layers (Weather, Earthquakes, Fires, AQI, Hospitals)
 """
 
-__version__ = "0.1.7-beta"
+__version__ = "0.1.8-beta"
 VERSION = __version__
 
 import sys
@@ -88,6 +88,7 @@ from tnc import AFSKModulator, APRSPacketBuilder, apply_cosine_ramp
 from tnc.vara import VARAFMInterface, send_aprs_beacon_vara
 from tnc.map import write_map_html
 from tnc.monitors import MonitorsMixin
+from tnc.ptt import PTTMixin
 
 # Alias for compatibility
 VARAInterface = VARAFMInterface
@@ -812,7 +813,7 @@ class LogPage(QWebEnginePage):
         return True
 
 
-class MainWindow(MonitorsMixin, QMainWindow):
+class MainWindow(MonitorsMixin, PTTMixin, QMainWindow):
     # Signals for thread-safe UI updates
     aprs_is_connected_signal = pyqtSignal()
     aprs_is_disconnected_signal = pyqtSignal()
@@ -843,6 +844,21 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.map_checks = 0
         self.log_buf = []
         self.log_history = []  # Full history for filtering
+
+        # Audio API filter: default to MME (what VARA FM uses) — one row per physical device.
+        # Users can widen this via the "Show all audio APIs" toggle on the Settings tab.
+        self.audio_preferred_api = "MME"
+        self.audio_show_all_apis = False
+
+        # Device aliases (right-click → Rename on any device combo).
+        # Keys per bucket:
+        #   audio_input / audio_output → f"{device_name} [{api_short}]"
+        #   serial                     → port name (e.g. "COM3")
+        self.device_aliases = {
+            "audio_input": {},
+            "audio_output": {},
+            "serial": {},
+        }
         
         # Station status/info cache - stores last status message per callsign
         self.station_status = {}  # {callsign: "status text"}
@@ -931,6 +947,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         # Initialize connection status display
         QTimer.singleShot(100, self._sync_beacon_connection_status)
+
+        # Start the always-on Settings-tab RX level monitor. Delayed slightly so the
+        # UI is fully painted and load_settings has restored the device selection.
+        QTimer.singleShot(750, self._start_settings_audio_monitor)
 
     def _init(self):
         global HESSU_SYMBOLS_DIR
@@ -1491,6 +1511,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 color: #90caf9;
             }
         """)
+        # Clear the APRS-tab unread marker when the user switches to APRS
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         
         # Tab 1: Receive - includes RX audio controls AND split view
         rx_tab = QWidget()
@@ -1548,6 +1570,262 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 height: 0;
             }
         """)
+
+    def _build_messaging_group(self):
+        """Build the compact APRS messaging group (lives in APRS tab, under Beacon Settings)."""
+        from PyQt6.QtWidgets import QToolButton, QMenu
+
+        grp = QGroupBox("💬 APRS Messaging")
+        grp.setStyleSheet(self._group_style())
+        v = QVBoxLayout(grp)
+        v.setSpacing(4)
+        v.setContentsMargins(8, 8, 8, 8)
+
+        # Row 1: To callsign + Recent dropdown
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
+
+        to_lbl = QLabel("To:")
+        to_lbl.setStyleSheet("color: #b0bec5; font-size: 11px;")
+        to_lbl.setFixedWidth(20)
+        row1.addWidget(to_lbl)
+
+        self.msg_to_edit = QLineEdit()
+        self.msg_to_edit.setPlaceholderText("CALLSIGN-SSID")
+        self.msg_to_edit.setMaxLength(9)
+        self.msg_to_edit.setStyleSheet("""
+            QLineEdit {
+                background: #0a1929; color: #ffd54f;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 2px 6px; font-family: 'Consolas','Courier New',monospace;
+                font-size: 12px;
+            }
+            QLineEdit:focus { border: 1px solid #42a5f5; }
+        """)
+        # uppercase on the fly
+        self.msg_to_edit.textChanged.connect(
+            lambda t: self.msg_to_edit.setText(t.upper()) if t != t.upper() else None
+        )
+        row1.addWidget(self.msg_to_edit, 1)
+
+        self.msg_recent_btn = QToolButton()
+        self.msg_recent_btn.setText("Recent ▾")
+        self.msg_recent_btn.setToolTip("Recent callsigns you've messaged")
+        self.msg_recent_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.msg_recent_btn.setStyleSheet("""
+            QToolButton {
+                background: #1a2a3a; color: #80cbc4;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 2px 6px; font-size: 11px;
+            }
+            QToolButton:hover { background: #1e3a5f; }
+            QToolButton::menu-indicator { image: none; width: 0; }
+        """)
+        self._msg_recent_menu = QMenu(self.msg_recent_btn)
+        self.msg_recent_btn.setMenu(self._msg_recent_menu)
+        row1.addWidget(self.msg_recent_btn)
+
+        v.addLayout(row1)
+
+        # Row 2: Message text + char counter
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+
+        self.msg_text_edit = QLineEdit()
+        self.msg_text_edit.setPlaceholderText("Message text (max 67 chars)")
+        self.msg_text_edit.setMaxLength(67)
+        self.msg_text_edit.setStyleSheet("""
+            QLineEdit {
+                background: #0a1929; color: #80deea;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 2px 6px; font-family: 'Consolas','Courier New',monospace;
+                font-size: 12px;
+            }
+            QLineEdit:focus { border: 1px solid #42a5f5; }
+        """)
+        self.msg_text_edit.textChanged.connect(self._msg_update_counter)
+        # Enter key sends via RF by default (matches beacon behavior)
+        self.msg_text_edit.returnPressed.connect(self._send_message_rf_btn)
+        row2.addWidget(self.msg_text_edit, 1)
+
+        self.msg_char_count = QLabel("0/67")
+        self.msg_char_count.setStyleSheet("color: #607d8b; font-size: 10px; min-width: 32px;")
+        self.msg_char_count.setFixedWidth(36)
+        self.msg_char_count.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row2.addWidget(self.msg_char_count)
+
+        v.addLayout(row2)
+
+        # Row 3: Ack checkbox + status + IS button + RF button
+        row3 = QHBoxLayout()
+        row3.setSpacing(4)
+
+        self.msg_request_ack = QCheckBox("Ack")
+        self.msg_request_ack.setChecked(True)
+        self.msg_request_ack.setToolTip("Request acknowledgment from receiving station")
+        self.msg_request_ack.setStyleSheet("color: #b0bec5; font-size: 11px;")
+        row3.addWidget(self.msg_request_ack)
+
+        self.msg_status = QLabel("")
+        self.msg_status.setStyleSheet("color: #607d8b; font-size: 11px;")
+        row3.addWidget(self.msg_status, 1)
+
+        self.msg_send_is_btn = QPushButton("🌐 IS")
+        self.msg_send_is_btn.setToolTip("Send message via APRS-IS")
+        self.msg_send_is_btn.setFixedHeight(26)
+        self.msg_send_is_btn.setMinimumWidth(60)
+        self.msg_send_is_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1565c0, stop:1 #0d47a1);
+                color: white; font-weight: bold; font-size: 11px;
+                border: 1px solid #42a5f5; border-radius: 4px;
+            }
+            QPushButton:hover { background: #1976d2; }
+            QPushButton:disabled { background: #263238; color: #607d8b; border-color: #37474f; }
+        """)
+        self.msg_send_is_btn.clicked.connect(self._send_message_is_btn)
+        row3.addWidget(self.msg_send_is_btn)
+
+        self.msg_send_rf_btn = QPushButton("📡 RF")
+        self.msg_send_rf_btn.setToolTip("Send message via RF (AX.25 / AFSK)")
+        self.msg_send_rf_btn.setFixedHeight(26)
+        self.msg_send_rf_btn.setMinimumWidth(60)
+        self.msg_send_rf_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #ef6c00, stop:1 #bf360c);
+                color: white; font-weight: bold; font-size: 11px;
+                border: 1px solid #ffb74d; border-radius: 4px;
+            }
+            QPushButton:hover { background: #f57c00; }
+            QPushButton:disabled { background: #263238; color: #607d8b; border-color: #37474f; }
+        """)
+        self.msg_send_rf_btn.clicked.connect(self._send_message_rf_btn)
+        row3.addWidget(self.msg_send_rf_btn)
+
+        v.addLayout(row3)
+
+        # Terminal-style message log — stretches to fill the right-panel half
+        self.msg_history = QTextEdit()
+        self.msg_history.setReadOnly(True)
+        self.msg_history.setMinimumHeight(120)
+        self.msg_history.setStyleSheet("""
+            QTextEdit {
+                background: #000000; color: #00ff00;
+                font-family: 'Consolas','Courier New',monospace; font-size: 11px;
+                border: 1px solid #1e3a5f; border-radius: 3px; padding: 4px;
+            }
+        """)
+        # Right-click context menu for messages (reply / copy / resend)
+        self.msg_history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.msg_history.customContextMenuRequested.connect(self._msg_log_context_menu)
+        v.addWidget(self.msg_history, 1)  # stretch factor 1 — fills available vertical space
+
+        # Hidden dummy widget retained for compatibility with old code paths
+        # that reference self.msg_header / self.conv_list
+        self.msg_header = QLabel()
+        self.msg_header.hide()
+        self.conv_list = QListWidget()
+        self.conv_list.hide()
+
+        return grp
+
+    def _msg_update_counter(self, text):
+        """Update the 0/67 character counter and color it as it approaches the limit."""
+        n = len(text)
+        self.msg_char_count.setText(f"{n}/67")
+        if n >= 67:
+            self.msg_char_count.setStyleSheet("color: #ef5350; font-size: 10px; font-weight: bold;")
+        elif n >= 60:
+            self.msg_char_count.setStyleSheet("color: #ffb74d; font-size: 10px;")
+        else:
+            self.msg_char_count.setStyleSheet("color: #607d8b; font-size: 10px;")
+
+    def _msg_recent_callsigns(self, limit=10):
+        """Return up to `limit` unique remote callsigns we've recently exchanged messages with,
+        most-recent first."""
+        my_call = self.callsign_edit.text().strip().upper()
+        my_ssid = self.ssid_combo.currentData() or 0
+        my_full = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
+
+        seen = []
+        # Walk all conversations newest-last (insertion order is arrival order)
+        for callsign, msgs in self.conversations.items():
+            if not msgs:
+                continue
+            remote = callsign.upper()
+            if remote == my_full:
+                continue
+            if remote not in seen:
+                seen.append(remote)
+        # Sort by last-message time (descending) so most-recent appears first
+        seen.sort(
+            key=lambda c: self.conversations[c][-1].get("ts_iso", self.conversations[c][-1].get("time", "")),
+            reverse=True
+        )
+        return seen[:limit]
+
+    def _msg_refresh_recent_menu(self):
+        """Rebuild the Recent callsign dropdown menu."""
+        if not hasattr(self, "_msg_recent_menu"):
+            return
+        self._msg_recent_menu.clear()
+        recents = self._msg_recent_callsigns()
+        if not recents:
+            act = self._msg_recent_menu.addAction("(no recent messages)")
+            act.setEnabled(False)
+            return
+        for call in recents:
+            act = self._msg_recent_menu.addAction(call)
+            act.triggered.connect(lambda checked=False, c=call: self.msg_to_edit.setText(c))
+
+    def _msg_log_context_menu(self, pos):
+        """Right-click menu on the message log: Reply / Copy / Resend / Clear."""
+        from PyQt6.QtWidgets import QMenu, QApplication
+        cursor = self.msg_history.cursorForPosition(pos)
+        cursor.select(cursor.SelectionType.LineUnderCursor)
+        line = cursor.selectedText().strip()
+
+        menu = QMenu(self.msg_history)
+
+        # Try to parse callsign and text from line: "[HH:MM:SS] FROM>TO: text ..."
+        remote_call = None
+        msg_text = None
+        try:
+            if line.startswith("[") and "]" in line:
+                rest = line.split("]", 1)[1].strip()
+                if ">" in rest and ":" in rest:
+                    left, right = rest.split(":", 1)
+                    src, dst = left.split(">", 1)
+                    my_call = self.callsign_edit.text().strip().upper()
+                    my_ssid = self.ssid_combo.currentData() or 0
+                    my_full = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
+                    # If we sent it, reply target is the recipient; otherwise the sender
+                    remote_call = dst.strip() if src.strip() == my_full else src.strip()
+                    # Strip trailing status markers from text
+                    msg_text = right.strip()
+                    for marker in (" ✓ack", " ✓", " ⏳", " ✗"):
+                        if marker in msg_text:
+                            msg_text = msg_text.split(marker)[0].strip()
+        except Exception:
+            pass
+
+        if remote_call:
+            reply_act = menu.addAction(f"↩ Reply to {remote_call}")
+            reply_act.triggered.connect(lambda: (self.msg_to_edit.setText(remote_call),
+                                                  self.msg_text_edit.setFocus()))
+        if msg_text:
+            copy_act = menu.addAction("📋 Copy text")
+            copy_act.triggered.connect(lambda: QApplication.clipboard().setText(msg_text))
+            resend_act = menu.addAction("🔁 Resend in compose")
+            resend_act.triggered.connect(lambda: (self.msg_to_edit.setText(remote_call or ""),
+                                                   self.msg_text_edit.setText(msg_text)))
+        menu.addSeparator()
+        clear_act = menu.addAction("🗑 Clear log view")
+        clear_act.triggered.connect(self.msg_history.clear)
+
+        menu.exec(self.msg_history.viewport().mapToGlobal(pos))
 
     def _build_settings_tab(self):
         """Build the Transmit & Beacon tab - simplified, connections in Settings"""
@@ -1926,7 +2204,28 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.aprs_objects = []  # list of dicts
         self._objects_window = None  # floating window reference
 
-        left_layout.addStretch()
+        # ── TX Log (moved from right panel — sits at bottom of left column) ──
+        log_grp = QGroupBox("📝 TX Log")
+        log_grp.setStyleSheet(self._group_style())
+        log_layout = QVBoxLayout(log_grp)
+
+        self.preset_log = QTextEdit()
+        self.preset_log.setReadOnly(True)
+        self.preset_log.setStyleSheet("""
+            QTextEdit {
+                background: #000000; color: #00ff00;
+                font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;
+                border: 2px solid #1e3a5f; border-radius: 4px; padding: 8px;
+            }
+        """)
+        log_layout.addWidget(self.preset_log)
+
+        clear_log_btn = QPushButton("🗑️ Clear Log")
+        clear_log_btn.setFixedWidth(100)
+        clear_log_btn.clicked.connect(lambda: self.preset_log.clear())
+        log_layout.addWidget(clear_log_btn)
+
+        left_layout.addWidget(log_grp, 1)  # stretch factor 1 — takes remaining vertical space
 
         settings_layout.addWidget(left_panel, 1)
         
@@ -1992,29 +2291,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
         symbol_layout.addWidget(scroll)
         
         right_layout.addWidget(symbol_grp, 1)  # stretch factor 1
-        
-        # TX Log - bigger, takes remaining space
-        log_grp = QGroupBox("📝 TX Log")
-        log_grp.setStyleSheet(self._group_style())
-        log_layout = QVBoxLayout(log_grp)
-        
-        self.preset_log = QTextEdit()
-        self.preset_log.setReadOnly(True)
-        self.preset_log.setStyleSheet("""
-            QTextEdit {
-                background: #000000; color: #00ff00;
-                font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;
-                border: 2px solid #1e3a5f; border-radius: 4px; padding: 8px;
-            }
-        """)
-        log_layout.addWidget(self.preset_log)
-        
-        clear_log_btn = QPushButton("🗑️ Clear Log")
-        clear_log_btn.setFixedWidth(100)
-        clear_log_btn.clicked.connect(lambda: self.preset_log.clear())
-        log_layout.addWidget(clear_log_btn)
-        
-        right_layout.addWidget(log_grp, 1)  # stretch factor 1 - same size as symbol picker
+
+        # ── APRS Messaging (replaces former right-panel TX Log slot) ──────────
+        # Same stretch factor 1 → equal halves with the symbol picker
+        right_layout.addWidget(self._build_messaging_group(), 1)
         right_layout.addWidget(self._branding_label())  # Inside right panel like VARA FM
         
         # Build initial symbol grid
@@ -2024,22 +2304,19 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         self.tabs.addTab(settings_tab, "📻 APRS")
         
-        # Initialize message storage (for future use)
+        # Initialize message storage
         self.conversations_file = BASE_DIR / "pytnc_conversations.json"
-        self.conversations = {}  # {callsign: [{"from": x, "to": y, "text": z, "time": t, "acked": bool}]}
+        self.conversations = {}  # {callsign: [{"from": x, "to": y, "text": z, "time": t, "ts_iso": iso, "acked": bool, "seq": s}]}
         self.current_conv = None
         self.msg_seq = 0  # Message sequence number for acks
         
         # Custom locations (loaded from CSV)
         self.custom_locations = []  # [{"name": x, "lat": y, "lon": z, "symbol": s, "comment": c}]
         
-        # Dummy message UI elements (Messages tab removed, but code still references them)
-        self.msg_status = QLabel()
-        self.msg_to_edit = QLineEdit()
-        self.msg_text_edit = QLineEdit()
-        self.msg_header = QLabel()
-        self.msg_history = QTextEdit()
-        self.conv_list = QListWidget()
+        # Load saved conversations from disk and render
+        self._load_conversations()
+        self._refresh_message_history()
+        self._msg_refresh_recent_menu()
         
         # =====================================================================
         # SETTINGS TAB (build first to create widget)
@@ -2377,14 +2654,23 @@ class MainWindow(MonitorsMixin, QMainWindow):
         ptt_grp.setStyleSheet(self._group_style())
         ptt_layout = QGridLayout(ptt_grp)
         ptt_layout.setSpacing(4)
-        
-        # Row 0: Serial port settings
+
+        # Row 0: PTT Method selector
+        ptt_layout.addWidget(QLabel("Method:"), 0, 0)
+        self.ptt_method_combo = QComboBox()
+        self.ptt_method_combo.addItems(["RTS/DTR", "CM108 GPIO", "CI-V CAT", "Yaesu CAT"])
+        self.ptt_method_combo.setToolTip("RTS/DTR: standard serial PTT\nCM108 GPIO: DigiRig Lite, AllScan URI\nCI-V CAT: Icom radios\nYaesu CAT: FT-991A, FT-891, FT-710 via rear DATA port")
+        self.ptt_method_combo.currentTextChanged.connect(self._on_ptt_method_changed)
+        ptt_layout.addWidget(self.ptt_method_combo, 0, 1, 1, 3)
+
+        # Row 1: Serial port settings (RTS/DTR)
         self.ptt_serial_widget = QWidget()
         ptt_serial_layout = QHBoxLayout(self.ptt_serial_widget)
         ptt_serial_layout.setContentsMargins(0, 0, 0, 0)
         ptt_serial_layout.addWidget(QLabel("Port:"))
         self.settings_ptt_combo = QComboBox()
         self._populate_serial_combo(self.settings_ptt_combo)
+        self._bind_device_context_menu(self.settings_ptt_combo, "serial")
         ptt_serial_layout.addWidget(self.settings_ptt_combo)
         self.settings_ptt_btn = QPushButton("Connect")
         self.settings_ptt_btn.setFixedWidth(70)
@@ -2392,9 +2678,9 @@ class MainWindow(MonitorsMixin, QMainWindow):
         ptt_serial_layout.addWidget(self.settings_ptt_btn)
         self.settings_ptt_status = QLabel("⚫")
         ptt_serial_layout.addWidget(self.settings_ptt_status)
-        ptt_layout.addWidget(self.ptt_serial_widget, 0, 0, 1, 4)
-        
-        # Row 1: PTT Line settings - separate RTS and DTR
+        ptt_layout.addWidget(self.ptt_serial_widget, 1, 0, 1, 4)
+
+        # Row 2: PTT Line settings - separate RTS and DTR
         self.ptt_lines_widget = QWidget()
         ptt_lines_layout = QHBoxLayout(self.ptt_lines_widget)
         ptt_lines_layout.setContentsMargins(0, 0, 0, 0)
@@ -2405,11 +2691,114 @@ class MainWindow(MonitorsMixin, QMainWindow):
         ptt_lines_layout.addWidget(QLabel("DTR:"))
         self.ptt_dtr_combo = QComboBox()
         self.ptt_dtr_combo.addItems(["Off", "High=TX", "Low=TX"])
-        self.ptt_dtr_combo.setCurrentIndex(1)  # Default DTR High=TX
+        self.ptt_dtr_combo.setCurrentIndex(1)
         ptt_lines_layout.addWidget(self.ptt_dtr_combo)
-        ptt_layout.addWidget(self.ptt_lines_widget, 1, 0, 1, 4)
-        
-        # Row 2: Test PTT button
+        ptt_layout.addWidget(self.ptt_lines_widget, 2, 0, 1, 4)
+
+        # CM108 GPIO widget
+        self.cm108_widget = QWidget()
+        cm108_layout = QHBoxLayout(self.cm108_widget)
+        cm108_layout.setContentsMargins(0, 0, 0, 0)
+        cm108_layout.addWidget(QLabel("Device:"))
+        self.cm108_device_combo = QComboBox()
+        self.cm108_device_combo.setToolTip("CM108-based USB audio device (DigiRig Lite, AllScan URI)")
+        cm108_layout.addWidget(self.cm108_device_combo, 1)
+        self.cm108_refresh_btn = QPushButton("🔄")
+        self.cm108_refresh_btn.setFixedWidth(28)
+        self.cm108_refresh_btn.clicked.connect(self._cm108_scan)
+        cm108_layout.addWidget(self.cm108_refresh_btn)
+        self.cm108_connect_btn = QPushButton("Connect")
+        self.cm108_connect_btn.setFixedWidth(70)
+        self.cm108_connect_btn.clicked.connect(self._toggle_cm108)
+        cm108_layout.addWidget(self.cm108_connect_btn)
+        self.cm108_status = QLabel("⚫")
+        cm108_layout.addWidget(self.cm108_status)
+        ptt_layout.addWidget(self.cm108_widget, 1, 0, 1, 4)
+        self.cm108_widget.hide()
+
+        # CI-V CAT widget
+        self.civ_widget = QWidget()
+        civ_layout = QGridLayout(self.civ_widget)
+        civ_layout.setContentsMargins(0, 4, 0, 0)
+        civ_layout.setSpacing(4)
+
+        # Row 0: Port + Baud + Connect
+        civ_layout.addWidget(QLabel("CI-V Port:"), 0, 0)
+        self.civ_port_combo = QComboBox()
+        self._populate_serial_combo(self.civ_port_combo)
+        civ_layout.addWidget(self.civ_port_combo, 0, 1)
+        self.civ_baud_combo = QComboBox()
+        self.civ_baud_combo.addItems(["4800", "9600", "19200", "38400"])
+        self.civ_baud_combo.setCurrentText("19200")
+        self.civ_baud_combo.setFixedWidth(70)
+        self.civ_baud_combo.setToolTip("Baud rate — IC-7100 default: 19200")
+        civ_layout.addWidget(self.civ_baud_combo, 0, 2)
+        self.civ_connect_btn = QPushButton("Connect")
+        self.civ_connect_btn.setFixedWidth(70)
+        self.civ_connect_btn.clicked.connect(self._toggle_civ)
+        civ_layout.addWidget(self.civ_connect_btn, 0, 3)
+        self.civ_status = QLabel("⚫")
+        civ_layout.addWidget(self.civ_status, 0, 4)
+
+        # Row 1: Data bits, Parity, Stop bits, CI-V address
+        civ_layout.addWidget(QLabel("Data:"), 1, 0)
+        self.civ_data_combo = QComboBox()
+        self.civ_data_combo.addItems(["8", "7"])
+        self.civ_data_combo.setFixedWidth(44)
+        civ_layout.addWidget(self.civ_data_combo, 1, 1)
+        self.civ_parity_combo = QComboBox()
+        self.civ_parity_combo.addItems(["None", "Even", "Odd"])
+        self.civ_parity_combo.setFixedWidth(60)
+        self.civ_parity_combo.setToolTip("Parity — Icom default: None")
+        civ_layout.addWidget(self.civ_parity_combo, 1, 2)
+        self.civ_stop_combo = QComboBox()
+        self.civ_stop_combo.addItems(["1", "2"])
+        self.civ_stop_combo.setFixedWidth(44)
+        self.civ_stop_combo.setToolTip("Stop bits — Icom default: 1")
+        civ_layout.addWidget(self.civ_stop_combo, 1, 3)
+
+        # Row 2: CI-V address
+        civ_addr_row = QWidget()
+        civ_addr_layout = QHBoxLayout(civ_addr_row)
+        civ_addr_layout.setContentsMargins(0, 0, 0, 0)
+        civ_addr_layout.addWidget(QLabel("CI-V Addr (hex):"))
+        self.civ_addr_edit = QLineEdit("88")
+        self.civ_addr_edit.setFixedWidth(40)
+        self.civ_addr_edit.setMaxLength(2)
+        self.civ_addr_edit.setToolTip("CI-V address in hex — IC-7100: 88  IC-7300: 94  IC-9700: A2  IC-705: A4")
+        self.civ_addr_edit.setStyleSheet("background:#0a1929; color:#ffd54f; border:1px solid #1e3a5f; border-radius:3px; padding:2px 4px;")
+        civ_addr_layout.addWidget(self.civ_addr_edit)
+        civ_addr_layout.addStretch()
+        civ_layout.addWidget(civ_addr_row, 2, 0, 1, 5)
+
+        ptt_layout.addWidget(self.civ_widget, 1, 0, 1, 4)
+        self.civ_widget.hide()
+
+        # Yaesu CAT widget
+        self.yaesu_widget = QWidget()
+        yaesu_layout = QHBoxLayout(self.yaesu_widget)
+        yaesu_layout.setContentsMargins(0, 0, 0, 0)
+        yaesu_layout.addWidget(QLabel("Port:"))
+        self.yaesu_port_combo = QComboBox()
+        self._populate_serial_combo(self.yaesu_port_combo)
+        yaesu_layout.addWidget(self.yaesu_port_combo)
+        yaesu_layout.addWidget(QLabel("Baud:"))
+        self.yaesu_baud_combo = QComboBox()
+        self.yaesu_baud_combo.addItems(["4800", "9600", "19200", "38400"])
+        self.yaesu_baud_combo.setCurrentText("38400")
+        self.yaesu_baud_combo.setFixedWidth(70)
+        self.yaesu_baud_combo.setToolTip("CAT baud rate — FT-991A default: 38400 (Menu 031)")
+        yaesu_layout.addWidget(self.yaesu_baud_combo)
+        self.yaesu_connect_btn = QPushButton("Connect")
+        self.yaesu_connect_btn.setFixedWidth(70)
+        self.yaesu_connect_btn.clicked.connect(self._toggle_yaesu_cat)
+        yaesu_layout.addWidget(self.yaesu_connect_btn)
+        self.yaesu_status = QLabel("⚫")
+        yaesu_layout.addWidget(self.yaesu_status)
+        ptt_layout.addWidget(self.yaesu_widget, 1, 0, 1, 4)
+        self.yaesu_widget.hide()
+
+        # Row 3: Test PTT button
         self.ptt_test_btn = QPushButton("🔴 Test PTT")
         self.ptt_test_btn.setStyleSheet("""
             QPushButton { background: #c62828; color: white; font-weight: bold; border-radius: 4px; padding: 4px; }
@@ -2418,7 +2807,16 @@ class MainWindow(MonitorsMixin, QMainWindow):
         """)
         self.ptt_test_btn.pressed.connect(self._ptt_test_on)
         self.ptt_test_btn.released.connect(self._ptt_test_off)
-        ptt_layout.addWidget(self.ptt_test_btn, 4, 0, 1, 4)
+        ptt_layout.addWidget(self.ptt_test_btn, 3, 0, 1, 4)
+
+        # Initialize PTT state
+        self.cm108_device = None
+        self.civ_serial = None
+        self.civ_ptt_method = "RTS/DTR"
+        try:
+            self._cm108_scan()
+        except Exception:
+            pass
         left_col.addWidget(ptt_grp)
         
         # === GPS PORT ===
@@ -2430,6 +2828,7 @@ class MainWindow(MonitorsMixin, QMainWindow):
         # Row 0: Port, baud, connect button
         self.settings_gps_combo = QComboBox()
         self._populate_serial_combo(self.settings_gps_combo)
+        self._bind_device_context_menu(self.settings_gps_combo, "serial")
         gps_layout.addWidget(self.settings_gps_combo, 0, 0)
         
         self.gps_baud_combo = QComboBox()
@@ -2479,12 +2878,17 @@ class MainWindow(MonitorsMixin, QMainWindow):
         audio_layout.addWidget(QLabel("RX:"), 0, 0)
         self.settings_rx_audio_combo = QComboBox()
         self._populate_audio_inputs(self.settings_rx_audio_combo)
+        self.settings_rx_audio_combo.currentIndexChanged.connect(
+            lambda _: self._start_settings_audio_monitor()
+        )
+        self._bind_device_context_menu(self.settings_rx_audio_combo, "audio_input")
         audio_layout.addWidget(self.settings_rx_audio_combo, 0, 1)
         
         audio_layout.addWidget(QLabel("TX:"), 1, 0)
         self.settings_tx_audio_combo = QComboBox()
         self._populate_audio_outputs(self.settings_tx_audio_combo)
         self.settings_tx_audio_combo.currentIndexChanged.connect(self._on_tx_audio_changed)
+        self._bind_device_context_menu(self.settings_tx_audio_combo, "audio_output")
         audio_layout.addWidget(self.settings_tx_audio_combo, 1, 1)
         
         audio_layout.addWidget(QLabel("RX Gain:"), 2, 0)
@@ -2512,8 +2916,77 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.settings_tx_level_label.setFixedWidth(35)
         tx_level_layout.addWidget(self.settings_tx_level_label)
         audio_layout.addLayout(tx_level_layout, 3, 1)
-        
+
+        # Audio API filter — matches VARA FM's shorter picker by default (one row per device)
+        audio_layout.addWidget(QLabel("API:"), 4, 0)
+        api_row = QHBoxLayout()
+        api_row.setSpacing(6)
+        self.settings_audio_api_combo = QComboBox()
+        self.settings_audio_api_combo.setToolTip(
+            "Windows audio API filter. MME matches what VARA FM shows (one row per\n"
+            "physical device). Other APIs offer lower latency but each device appears\n"
+            "multiple times in the list."
+        )
+        for label, key in (("MME (like VARA FM)", "MME"),
+                           ("WASAPI (low latency)", "WASAPI"),
+                           ("DirectSound", "DirectSound"),
+                           ("WDM-KS (lowest latency)", "WDM-KS")):
+            self.settings_audio_api_combo.addItem(label, key)
+        # Preselect what __init__ chose (default MME)
+        for i in range(self.settings_audio_api_combo.count()):
+            if self.settings_audio_api_combo.itemData(i) == self.audio_preferred_api:
+                self.settings_audio_api_combo.setCurrentIndex(i)
+                break
+        self.settings_audio_api_combo.currentIndexChanged.connect(
+            lambda _: self._set_audio_api_filter(
+                preferred=self.settings_audio_api_combo.currentData())
+        )
+        api_row.addWidget(self.settings_audio_api_combo, 1)
+
+        self.settings_audio_show_all_chk = QCheckBox("Show all")
+        self.settings_audio_show_all_chk.setToolTip(
+            "Show every audio device on every API (long list).\n"
+            "Off = filter to the selected API only (short list, like VARA FM)."
+        )
+        self.settings_audio_show_all_chk.toggled.connect(
+            lambda v: self._set_audio_api_filter(show_all=v)
+        )
+        api_row.addWidget(self.settings_audio_show_all_chk)
+        audio_layout.addLayout(api_row, 4, 1)
+
         left_col.addWidget(audio_grp)
+
+        # ── RX Level meter (mirrors the one on the Receive tab) ───────────────
+        rx_meter_row = QHBoxLayout()
+        rx_meter_row.setContentsMargins(2, 0, 2, 0)
+        rx_meter_row.setSpacing(6)
+        rx_meter_lbl = QLabel("RX")
+        rx_meter_lbl.setStyleSheet("color: #ff6666; font-weight: bold; font-size: 12px;")
+        rx_meter_lbl.setFixedWidth(24)
+        rx_meter_row.addWidget(rx_meter_lbl)
+
+        self.settings_rx_meter = QProgressBar()
+        self.settings_rx_meter.setMaximum(100)
+        self.settings_rx_meter.setFixedHeight(18)
+        self.settings_rx_meter.setTextVisible(False)
+        self.settings_rx_meter.setToolTip(
+            "RX audio level from the selected input.\n"
+            "Live only while receive is running (▶ START on Receive tab)."
+        )
+        self.settings_rx_meter.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #aa3333;
+                border-radius: 4px;
+                background: #1a0a0a;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #cc0000, stop:0.5 #ff3333, stop:0.8 #ff6600, stop:1 #ffcc00);
+                border-radius: 2px;
+            }
+        """)
+        rx_meter_row.addWidget(self.settings_rx_meter, 1)
+        left_col.addLayout(rx_meter_row)
         
         left_col.addStretch()
         main_layout.addLayout(left_col)
@@ -3586,6 +4059,460 @@ class MainWindow(MonitorsMixin, QMainWindow):
         except Exception as e:
             self._igate_log_entry(f"⚠️ IGate beacon error: {e}", "#ef5350")
 
+    def _my_callsign_for_vara(self):
+        """Resolve the user's callsign for VARA operations.
+
+        The app has two callsign widgets (APRS tab and VARA tab). They are meant to be
+        sync'd but can fall out of step. This helper prefers whichever has a real value
+        (not N0CALL / not blank), defaulting to the APRS-tab field as the legacy source
+        of truth.
+
+        Returns (callsign, ssid, full_call) where full_call is "CALL-SSID" or just "CALL"
+        when SSID is 0.
+        """
+        def _read(edit_name, combo_name):
+            call = ""
+            ssid = 0
+            try:
+                if hasattr(self, edit_name):
+                    call = (getattr(self, edit_name).text() or "").strip().upper()
+                if hasattr(self, combo_name):
+                    ssid = getattr(self, combo_name).currentData() or 0
+            except Exception:
+                pass
+            return call, int(ssid or 0)
+
+        # Try VARA tab first if it has a real value, then APRS tab
+        v_call, v_ssid = _read("vara_callsign_edit", "vara_ssid_combo")
+        a_call, a_ssid = _read("callsign_edit", "ssid_combo")
+
+        def _is_real(c):
+            return bool(c) and c != "N0CALL"
+
+        if _is_real(v_call):
+            call, ssid = v_call, v_ssid
+        elif _is_real(a_call):
+            call, ssid = a_call, a_ssid
+        else:
+            call, ssid = (v_call or a_call or "N0CALL"), 0
+
+        full_call = f"{call}-{ssid}" if ssid > 0 else call
+        return call, ssid, full_call
+
+    def _build_vara_chat_group(self):
+        """Build the VARA Chat group (lives in VARA FM tab right panel, replacing the old log slot).
+
+        Provides a target callsign + Link/Disconnect controls, a status line, a scrollable
+        chat history, and an input line + Send button. Mirrors the APRS messaging design.
+        """
+        from PyQt6.QtWidgets import QToolButton, QMenu
+
+        # Initialize chat-related state early (helpers below depend on these attributes)
+        if not hasattr(self, "vara_remote_call"):
+            self.vara_remote_call = None
+        if not hasattr(self, "_vara_is_connected_to_remote"):
+            self._vara_is_connected_to_remote = False
+
+        grp = QGroupBox("💬 VARA Chat")
+        grp.setStyleSheet(self._group_style())
+        v = QVBoxLayout(grp)
+        v.setSpacing(4)
+        v.setContentsMargins(8, 8, 8, 8)
+
+        # Row 1: Target callsign + Link button + Disconnect button
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
+
+        to_lbl = QLabel("Link to:")
+        to_lbl.setStyleSheet("color: #b0bec5; font-size: 11px;")
+        to_lbl.setFixedWidth(48)
+        row1.addWidget(to_lbl)
+
+        self.vara_chat_target = QLineEdit()
+        self.vara_chat_target.setPlaceholderText("REMOTE-CALL")
+        self.vara_chat_target.setMaxLength(9)
+        self.vara_chat_target.setStyleSheet("""
+            QLineEdit {
+                background: #0a1929; color: #ffd54f;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 2px 6px; font-family: 'Consolas','Courier New',monospace;
+                font-size: 12px;
+            }
+            QLineEdit:focus { border: 1px solid #42a5f5; }
+        """)
+        self.vara_chat_target.textChanged.connect(
+            lambda t: self.vara_chat_target.setText(t.upper()) if t != t.upper() else None
+        )
+        row1.addWidget(self.vara_chat_target, 1)
+
+        # Recent links dropdown
+        self.vara_chat_recent_btn = QToolButton()
+        self.vara_chat_recent_btn.setText("Recent ▾")
+        self.vara_chat_recent_btn.setToolTip("Recently linked stations")
+        self.vara_chat_recent_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.vara_chat_recent_btn.setStyleSheet("""
+            QToolButton {
+                background: #1a2a3a; color: #80cbc4;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 2px 6px; font-size: 11px;
+            }
+            QToolButton:hover { background: #1e3a5f; }
+            QToolButton::menu-indicator { image: none; width: 0; }
+        """)
+        self._vara_chat_recent_menu = QMenu(self.vara_chat_recent_btn)
+        self.vara_chat_recent_btn.setMenu(self._vara_chat_recent_menu)
+        row1.addWidget(self.vara_chat_recent_btn)
+
+        v.addLayout(row1)
+
+        # Row 2: Link / Disconnect buttons + status
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+
+        self.vara_chat_link_btn = QPushButton("🔗 Link")
+        self.vara_chat_link_btn.setToolTip("Establish a VARA P2P link to the remote station")
+        self.vara_chat_link_btn.setFixedHeight(26)
+        self.vara_chat_link_btn.setMinimumWidth(70)
+        self.vara_chat_link_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2e7d32, stop:1 #1b5e20);
+                color: white; font-weight: bold; font-size: 11px;
+                border: 1px solid #66bb6a; border-radius: 4px;
+            }
+            QPushButton:hover { background: #388e3c; }
+            QPushButton:disabled { background: #263238; color: #607d8b; border-color: #37474f; }
+        """)
+        self.vara_chat_link_btn.clicked.connect(self._vara_chat_link)
+        row2.addWidget(self.vara_chat_link_btn)
+
+        self.vara_chat_disconnect_btn = QPushButton("✂ Unlink")
+        self.vara_chat_disconnect_btn.setToolTip("Disconnect the VARA P2P link")
+        self.vara_chat_disconnect_btn.setFixedHeight(26)
+        self.vara_chat_disconnect_btn.setMinimumWidth(70)
+        self.vara_chat_disconnect_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #b71c1c, stop:1 #7f0000);
+                color: white; font-weight: bold; font-size: 11px;
+                border: 1px solid #e57373; border-radius: 4px;
+            }
+            QPushButton:hover { background: #c62828; }
+            QPushButton:disabled { background: #263238; color: #607d8b; border-color: #37474f; }
+        """)
+        self.vara_chat_disconnect_btn.clicked.connect(self._vara_chat_unlink)
+        self.vara_chat_disconnect_btn.setEnabled(False)
+        row2.addWidget(self.vara_chat_disconnect_btn)
+
+        self.vara_chat_status = QLabel("○ idle")
+        self.vara_chat_status.setStyleSheet("color: #607d8b; font-size: 11px;")
+        row2.addWidget(self.vara_chat_status, 1)
+
+        # 🐛 Debug toggle — surfaces noisy events (IAMALIVE, BUSY, hex previews) in the log
+        self.vara_debug_chk = QCheckBox("🐛 Debug")
+        self.vara_debug_chk.setToolTip(
+            "Verbose VARA logging: surface IAMALIVE / BUSY keepalives, every PTT cycle, "
+            "raw data-socket hex bytes, and periodic link-state summaries."
+        )
+        self.vara_debug_chk.setStyleSheet("color: #b0bec5; font-size: 11px;")
+        self.vara_debug_enabled = False
+        self.vara_debug_chk.toggled.connect(self._vara_set_debug)
+        row2.addWidget(self.vara_debug_chk)
+
+        v.addLayout(row2)
+
+        # Chat history — fills available vertical space
+        self.vara_chat = QTextEdit()
+        self.vara_chat.setReadOnly(True)
+        self.vara_chat.setMinimumHeight(120)
+        self.vara_chat.setStyleSheet("""
+            QTextEdit {
+                background: #000000; color: #00ff00;
+                font-family: 'Consolas','Courier New',monospace; font-size: 11px;
+                border: 1px solid #1e3a5f; border-radius: 3px; padding: 4px;
+            }
+        """)
+        self.vara_chat.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.vara_chat.customContextMenuRequested.connect(self._vara_chat_context_menu)
+        v.addWidget(self.vara_chat, 1)
+
+        # Input row: text + Send
+        row3 = QHBoxLayout()
+        row3.setSpacing(4)
+
+        self.vara_send_edit = QLineEdit()
+        self.vara_send_edit.setPlaceholderText("Type a message and press Enter — link required")
+        self.vara_send_edit.setStyleSheet("""
+            QLineEdit {
+                background: #0a1929; color: #80deea;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 2px 6px; font-family: 'Consolas','Courier New',monospace;
+                font-size: 12px;
+            }
+            QLineEdit:focus { border: 1px solid #42a5f5; }
+            QLineEdit:disabled { background: #0a1118; color: #455a64; }
+        """)
+        self.vara_send_edit.setEnabled(False)
+        self.vara_send_edit.returnPressed.connect(self._vara_send_chat)
+        row3.addWidget(self.vara_send_edit, 1)
+
+        self.vara_chat_send_btn = QPushButton("📤 Send")
+        self.vara_chat_send_btn.setToolTip("Send chat message over the VARA link")
+        self.vara_chat_send_btn.setFixedHeight(26)
+        self.vara_chat_send_btn.setMinimumWidth(70)
+        self.vara_chat_send_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1565c0, stop:1 #0d47a1);
+                color: white; font-weight: bold; font-size: 11px;
+                border: 1px solid #42a5f5; border-radius: 4px;
+            }
+            QPushButton:hover { background: #1976d2; }
+            QPushButton:disabled { background: #263238; color: #607d8b; border-color: #37474f; }
+        """)
+        self.vara_chat_send_btn.clicked.connect(self._vara_send_chat)
+        self.vara_chat_send_btn.setEnabled(False)
+        row3.addWidget(self.vara_chat_send_btn)
+
+        v.addLayout(row3)
+
+        # Chat persistence (per-remote conversations)
+        self.vara_chat_file = BASE_DIR / "pytnc_vara_chat.json"
+        self.vara_chat_log = {}  # {remote_call: [{"dir": "tx"/"rx"/"sys", "text": ..., "time": ..., "ts_iso": ...}]}
+
+        self._load_vara_chat()
+        self._refresh_vara_chat_view()
+        self._vara_chat_refresh_recent_menu()
+
+        return grp
+
+    def _load_vara_chat(self):
+        """Load saved VARA chat conversations from disk."""
+        try:
+            if not self.vara_chat_file.exists():
+                return
+            with open(self.vara_chat_file, "r") as f:
+                data = json.load(f)
+            self.vara_chat_log = data.get("conversations", {}) or {}
+            total = sum(len(v) for v in self.vara_chat_log.values())
+            if total:
+                self._log(f"💬 Loaded {total} VARA chat line(s) across {len(self.vara_chat_log)} contact(s)")
+        except Exception as e:
+            self._log(f"⚠️ Failed to load VARA chat: {e}")
+            self.vara_chat_log = {}
+
+    def _save_vara_chat(self):
+        """Persist VARA chat conversations to disk."""
+        try:
+            # Keep only the most-recent 200 lines per remote to bound the file size
+            trimmed = {k: v[-200:] for k, v in self.vara_chat_log.items()}
+            with open(self.vara_chat_file, "w") as f:
+                json.dump({"conversations": trimmed}, f, indent=2)
+        except Exception as e:
+            self._log(f"⚠️ Failed to save VARA chat: {e}")
+
+    def _vara_chat_recent_remotes(self, limit=10):
+        """Return recently linked remote callsigns, most-recent first."""
+        remotes = list(self.vara_chat_log.keys())
+        remotes.sort(
+            key=lambda c: self.vara_chat_log[c][-1].get("ts_iso", "") if self.vara_chat_log[c] else "",
+            reverse=True,
+        )
+        return remotes[:limit]
+
+    def _vara_chat_refresh_recent_menu(self):
+        """Rebuild the Recent callsign dropdown menu."""
+        if not hasattr(self, "_vara_chat_recent_menu"):
+            return
+        self._vara_chat_recent_menu.clear()
+        recents = self._vara_chat_recent_remotes()
+        if not recents:
+            act = self._vara_chat_recent_menu.addAction("(no recent contacts)")
+            act.setEnabled(False)
+            return
+        for call in recents:
+            act = self._vara_chat_recent_menu.addAction(call)
+            act.triggered.connect(lambda checked=False, c=call: self.vara_chat_target.setText(c))
+
+    def _vara_chat_context_menu(self, pos):
+        """Right-click menu on chat history: clear / copy line."""
+        from PyQt6.QtWidgets import QMenu, QApplication
+        cursor = self.vara_chat.cursorForPosition(pos)
+        cursor.select(cursor.SelectionType.LineUnderCursor)
+        line = cursor.selectedText().strip()
+
+        menu = QMenu(self.vara_chat)
+        if line:
+            copy_act = menu.addAction("📋 Copy line")
+            copy_act.triggered.connect(lambda: QApplication.clipboard().setText(line))
+        clear_act = menu.addAction("🗑 Clear chat view")
+        clear_act.triggered.connect(self.vara_chat.clear)
+        menu.exec(self.vara_chat.viewport().mapToGlobal(pos))
+
+    def _vara_chat_append(self, remote_call, direction, text):
+        """Append a single chat line to a remote's log, redraw, persist."""
+        import datetime
+        if not remote_call:
+            return
+        remote_call = remote_call.upper()
+        if remote_call not in self.vara_chat_log:
+            self.vara_chat_log[remote_call] = []
+        now = datetime.datetime.now()
+        self.vara_chat_log[remote_call].append({
+            "dir": direction,            # "tx" / "rx" / "sys"
+            "text": text,
+            "time": now.strftime("%H:%M:%S"),
+            "ts_iso": now.isoformat(timespec="seconds"),
+        })
+        self._refresh_vara_chat_view()
+        self._vara_chat_refresh_recent_menu()
+        self._save_vara_chat()
+
+    def _refresh_vara_chat_view(self):
+        """Re-render the current remote's chat history into self.vara_chat."""
+        if not hasattr(self, "vara_chat") or self.vara_chat is None:
+            return
+        self.vara_chat.clear()
+
+        # If linked, prefer that remote; otherwise show the most-recent remote we talked to
+        remote = self.vara_remote_call
+        if not remote:
+            remotes = self._vara_chat_recent_remotes(limit=1)
+            remote = remotes[0] if remotes else None
+        if not remote:
+            return
+
+        lines = self.vara_chat_log.get(remote, [])
+        lines = lines[-200:]  # cap visible
+
+        html = []
+        _, _, my_call = self._my_callsign_for_vara()
+        if not my_call:
+            my_call = "MYCALL"
+        for entry in lines:
+            t = entry.get("time", "")
+            txt = (entry.get("text") or "").replace("<", "&lt;").replace(">", "&gt;")
+            d = entry.get("dir", "rx")
+            if d == "tx":
+                # Outgoing — cool blue family, bold callsign, light-blue text, → arrow
+                arrow_html  = "<span style='color:#42a5f5;'>→</span>"
+                src_html    = f"<span style='color:#4fc3f7;font-weight:bold;'>{my_call}</span>"
+                text_html   = f"<span style='color:#b3e5fc;'>{txt}</span>"
+            elif d == "rx":
+                # Incoming — warm orange family, bold callsign, light-amber text, ← arrow
+                arrow_html  = "<span style='color:#ff9800;'>←</span>"
+                src_html    = f"<span style='color:#ffb74d;font-weight:bold;'>{remote}</span>"
+                text_html   = f"<span style='color:#ffe0b2;'>{txt}</span>"
+            else:  # sys
+                html.append(
+                    f"<span style='color:#607d8b;'>[{t}]</span> "
+                    f"<span style='color:#80cbc4;font-style:italic;'>• {txt}</span>"
+                )
+                continue
+            html.append(
+                f"<span style='color:#607d8b;'>[{t}]</span> "
+                f"{arrow_html} {src_html}"
+                f"<span style='color:#607d8b;'>:</span> "
+                f"{text_html}"
+            )
+        self.vara_chat.setHtml("<br>".join(html))
+        sb = self.vara_chat.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _vara_chat_set_status(self, text, color="#607d8b"):
+        """Update the small status label in the chat group's button row."""
+        if hasattr(self, "vara_chat_status") and self.vara_chat_status:
+            self.vara_chat_status.setText(text)
+            self.vara_chat_status.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _vara_set_debug(self, on):
+        """Toggle verbose VARA debug logging (picked up by the RX loops on next read)."""
+        self.vara_debug_enabled = bool(on)
+        self._vara_log(f"🐛 VARA debug logging: {'ON' if on else 'OFF'}")
+        if on:
+            # On enabling, dump current state so the user has a baseline
+            reg = getattr(self, "vara_registered_callsign", None) or "(not registered)"
+            linked = getattr(self, "_vara_is_connected_to_remote", False)
+            remote = getattr(self, "vara_remote_call", None) or "(none)"
+            self._vara_log(f"   • Registered MYCALL: {reg}")
+            self._vara_log(f"   • Link state: {'LINKED' if linked else 'idle'}")
+            self._vara_log(f"   • Remote: {remote}")
+            self._vara_log(f"   • vara_connected (daemon): {getattr(self, 'vara_connected', False)}")
+
+    def _vara_chat_set_linked_ui(self, linked, remote=None):
+        """Enable/disable chat controls based on link state."""
+        try:
+            self.vara_chat_link_btn.setEnabled(not linked)
+            self.vara_chat_disconnect_btn.setEnabled(linked)
+            self.vara_send_edit.setEnabled(linked)
+            self.vara_chat_send_btn.setEnabled(linked)
+            if linked and remote:
+                self._vara_chat_set_status(f"● linked to {remote}", "#69f0ae")
+                self.vara_chat_target.setText(remote)
+            elif linked:
+                self._vara_chat_set_status("● linked", "#69f0ae")
+            else:
+                self._vara_chat_set_status("○ idle", "#607d8b")
+        except Exception:
+            pass
+
+    def _vara_chat_link(self):
+        """Issue a CONNECT command to establish a VARA P2P link to the target."""
+        target = self.vara_chat_target.text().strip().upper()
+        if not target:
+            self._vara_chat_set_status("❌ Enter remote callsign", "#ef5350")
+            return
+        if not (self.vara_connected and self.vara_cmd_socket):
+            self._vara_chat_set_status("❌ VARA not connected (click Connect first)", "#ef5350")
+            return
+        if self._vara_is_connected_to_remote:
+            self._vara_chat_set_status("⚠️ Already linked — unlink first", "#ffb74d")
+            return
+
+        # CRITICAL: the source-call for CONNECT must EXACTLY match the MYCALL string
+        # registered with VARA at connect time. If we use a different SSID, VARA's
+        # listener won't recognize the inbound link-reply addressed to our outbound
+        # source-call and the link will silently fail with endless retransmits.
+        registered = getattr(self, "vara_registered_callsign", None)
+        if not registered:
+            self._vara_chat_set_status(
+                "❌ MYCALL not registered with VARA — reconnect the daemon first",
+                "#ef5350"
+            )
+            return
+
+        # Diagnostic: warn if the UI callsign field doesn't match what's registered.
+        # (The field change won't take effect until the daemon is reconnected.)
+        _, _, ui_full = self._my_callsign_for_vara()
+        if ui_full and ui_full != registered:
+            self._vara_log(
+                f"⚠️ UI callsign {ui_full} doesn't match registered MYCALL {registered}. "
+                f"Linking as {registered}. Disconnect/Reconnect VARA to re-register."
+            )
+
+        try:
+            # Source-call is the *registered* MYCALL, not whatever the UI currently reads.
+            self.vara_cmd_socket.send(f"CONNECT {registered} {target}\r".encode())
+            self.vara_remote_call = target
+            self._vara_chat_set_status(f"◐ linking to {target}…", "#64b5f6")
+            self._vara_chat_append(target, "sys", f"Linking to {target} (as {registered})…")
+            self._vara_log(f"🔗 CONNECT {registered} {target}")
+        except Exception as e:
+            self._vara_chat_set_status(f"❌ Link failed: {e}", "#ef5350")
+            self._vara_log(f"❌ Link error: {e}")
+
+    def _vara_chat_unlink(self):
+        """Issue a DISCONNECT command to tear down the current VARA P2P link."""
+        if not (self.vara_connected and self.vara_cmd_socket):
+            self._vara_chat_set_status("❌ VARA not connected", "#ef5350")
+            return
+        try:
+            self.vara_cmd_socket.send(b"DISCONNECT\r")
+            self._vara_chat_set_status("◐ disconnecting…", "#ffb74d")
+            self._vara_log("✂ DISCONNECT sent")
+        except Exception as e:
+            self._vara_chat_set_status(f"❌ Disconnect failed: {e}", "#ef5350")
+
     def _build_vara_tab(self):
         """Build VARA FM tab"""
         # =====================================================================
@@ -3821,8 +4748,46 @@ class MainWindow(MonitorsMixin, QMainWindow):
         vara_send_layout.addWidget(self.vara_beacon_btn)
         
         vara_left_layout.addWidget(vara_send_grp)
-        vara_left_layout.addStretch()
-        
+
+        # ── VARA FM Log (moved from right panel — sits at bottom of left column) ──
+        vara_log_grp = QGroupBox("📝 VARA FM Log")
+        vara_log_grp.setStyleSheet(self._group_style())
+        vara_log_layout = QVBoxLayout(vara_log_grp)
+        vara_log_layout.setSpacing(4)
+
+        # Top-right small Clear button row
+        vara_log_header = QHBoxLayout()
+        vara_log_header.setContentsMargins(0, 0, 0, 0)
+        vara_log_header.addStretch(1)
+        vara_clear_btn = QPushButton("🗑️")
+        vara_clear_btn.setToolTip("Clear log")
+        vara_clear_btn.setFixedSize(26, 22)
+        vara_clear_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a2a3a; color: #b0bec5;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                font-size: 11px; padding: 0;
+            }
+            QPushButton:hover { background: #1e3a5f; color: #ef5350; }
+            QPushButton:pressed { background: #0d1929; }
+        """)
+        vara_clear_btn.clicked.connect(lambda: self.vara_log.clear())
+        vara_log_header.addWidget(vara_clear_btn)
+        vara_log_layout.addLayout(vara_log_header)
+
+        self.vara_log = QTextEdit()
+        self.vara_log.setReadOnly(True)
+        self.vara_log.setStyleSheet("""
+            QTextEdit {
+                background: #000000; color: #00ff00;
+                font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;
+                border: 2px solid #1e3a5f; border-radius: 4px; padding: 8px;
+            }
+        """)
+        vara_log_layout.addWidget(self.vara_log)
+
+        vara_left_layout.addWidget(vara_log_grp, 1)  # stretch — takes remaining vertical space
+
         vara_layout.addWidget(vara_left_panel, 1)
         
         # Right panel - Symbol Picker and TX Log
@@ -3863,28 +4828,9 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         vara_right_layout.addWidget(vara_symbol_grp, 1)
         
-        # TX Log
-        vara_log_grp = QGroupBox("📝 VARA FM Log")
-        vara_log_grp.setStyleSheet(self._group_style())
-        vara_log_layout = QVBoxLayout(vara_log_grp)
-        
-        self.vara_log = QTextEdit()
-        self.vara_log.setReadOnly(True)
-        self.vara_log.setStyleSheet("""
-            QTextEdit {
-                background: #000000; color: #00ff00;
-                font-family: 'Consolas', 'Courier New', monospace; font-size: 12px;
-                border: 2px solid #1e3a5f; border-radius: 4px; padding: 8px;
-            }
-        """)
-        vara_log_layout.addWidget(self.vara_log)
-        
-        vara_clear_btn = QPushButton("🗑️ Clear Log")
-        vara_clear_btn.setFixedWidth(100)
-        vara_clear_btn.clicked.connect(lambda: self.vara_log.clear())
-        vara_log_layout.addWidget(vara_clear_btn)
-        
-        vara_right_layout.addWidget(vara_log_grp, 1)
+        # ── VARA Chat (replaces former right-panel log slot) ──────────────────
+        # Same stretch factor 1 → equal halves with the symbol picker
+        vara_right_layout.addWidget(self._build_vara_chat_group(), 1)
         vara_right_layout.addWidget(self._branding_label())
         
         vara_layout.addWidget(vara_right_panel, 1)
@@ -3906,55 +4852,701 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.vara_connected = False
     
     def _populate_serial_combo(self, combo):
-        """Populate a combo with available serial ports"""
+        """Populate a combo with available serial ports (with alias decoration)."""
         combo.clear()
         combo.addItem("-- Select --", None)
         if HAS_SERIAL:
             for port in serial.tools.list_ports.comports():
-                combo.addItem(f"{port.device} - {port.description}", port.device)
-    
+                raw = f"{port.device} - {port.description}"
+                alias = self._alias_get("serial", port.device)
+                combo.addItem(self._decorate_alias(alias, raw), port.device)
+
     def _populate_audio_inputs(self, combo):
-        """Populate combo with audio input devices - show index and host API"""
+        """Populate combo with audio input devices - filtered by API preference + aliases."""
         combo.clear()
         if not HAS_SOUNDDEVICE:
             combo.addItem("(sounddevice not installed)", -1)
             return
         try:
-            devices = sd.query_devices()
-            host_apis = sd.query_hostapis()
-            for i, dev in enumerate(devices):
-                if dev['max_input_channels'] > 0:
-                    # Get host API name (MME, WASAPI, etc)
-                    api_name = host_apis[dev['hostapi']]['name'] if dev['hostapi'] < len(host_apis) else "?"
-                    # Shorten common API names
-                    api_short = api_name.replace("Windows ", "").replace("DirectSound", "DS").replace("WASAPI", "WAS")
-                    sr = int(dev['default_samplerate'])
-                    ch = dev['max_input_channels']
-                    combo.addItem(f"{i}: {dev['name']} [{api_short}] {sr}Hz {ch}ch", i)
+            for i, dev, api_short, sr, ch in self._enum_audio("input"):
+                raw = f"{i}: {dev['name']} [{api_short}] {sr}Hz {ch}ch"
+                alias = self._alias_get("audio_input", self._audio_key(dev['name'], api_short))
+                combo.addItem(self._decorate_alias(alias, raw), i)
         except Exception as e:
             combo.addItem(f"(error: {e})", -1)
     
     def _populate_audio_outputs(self, combo):
-        """Populate combo with audio output devices - show index and host API"""
+        """Populate combo with audio output devices - filtered by API preference + aliases."""
         combo.clear()
         if not HAS_SOUNDDEVICE:
             combo.addItem("(sounddevice not installed)", -1)
             return
         try:
-            devices = sd.query_devices()
-            host_apis = sd.query_hostapis()
-            for i, dev in enumerate(devices):
-                if dev['max_output_channels'] > 0:
-                    # Get host API name (MME, WASAPI, etc)
-                    api_name = host_apis[dev['hostapi']]['name'] if dev['hostapi'] < len(host_apis) else "?"
-                    # Shorten common API names
-                    api_short = api_name.replace("Windows ", "").replace("DirectSound", "DS").replace("WASAPI", "WAS")
-                    sr = int(dev['default_samplerate'])
-                    ch = dev['max_output_channels']
-                    combo.addItem(f"{i}: {dev['name']} [{api_short}] {sr}Hz {ch}ch", i)
+            for i, dev, api_short, sr, ch in self._enum_audio("output"):
+                raw = f"{i}: {dev['name']} [{api_short}] {sr}Hz {ch}ch"
+                alias = self._alias_get("audio_output", self._audio_key(dev['name'], api_short))
+                combo.addItem(self._decorate_alias(alias, raw), i)
         except Exception as e:
             combo.addItem(f"(error: {e})", -1)
-    
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Centralized audio device enumeration with API filtering (matches VARA FM's
+    # behavior of showing one row per physical device via a single audio API).
+    # ─────────────────────────────────────────────────────────────────────────
+    def _enum_audio(self, direction):
+        """Yield (device_index, dev_dict, api_short, samplerate, channels) tuples for
+        the current API filter preference.
+
+        direction: "input" or "output"
+        """
+        if not HAS_SOUNDDEVICE or sd is None:
+            return
+        channels_key = "max_input_channels" if direction == "input" else "max_output_channels"
+        try:
+            devices = list(sd.query_devices())
+            host_apis = list(sd.query_hostapis())
+        except Exception:
+            return
+
+        show_all = bool(getattr(self, "audio_show_all_apis", False))
+        preferred = getattr(self, "audio_preferred_api", "MME")  # "MME", "WASAPI", "DirectSound", "WDM-KS"
+
+        def _api_short(name):
+            return (name or "?").replace("Windows ", "").replace("DirectSound", "DS").replace("WASAPI", "WAS")
+
+        # First pass: collect matches with the preferred API
+        picks = []
+        for i, dev in enumerate(devices):
+            if dev.get(channels_key, 0) <= 0:
+                continue
+            api_idx = dev.get("hostapi", -1)
+            api_name = host_apis[api_idx]["name"] if 0 <= api_idx < len(host_apis) else "?"
+            api_short = _api_short(api_name)
+            if show_all or (preferred and preferred in api_name):
+                picks.append((i, dev, api_short,
+                             int(dev.get("default_samplerate", 0) or 0),
+                             dev.get(channels_key, 0)))
+
+        # Fallback: if the preferred API produced nothing (rare), fall through to all
+        if not picks and not show_all:
+            for i, dev in enumerate(devices):
+                if dev.get(channels_key, 0) <= 0:
+                    continue
+                api_idx = dev.get("hostapi", -1)
+                api_name = host_apis[api_idx]["name"] if 0 <= api_idx < len(host_apis) else "?"
+                api_short = _api_short(api_name)
+                picks.append((i, dev, api_short,
+                             int(dev.get("default_samplerate", 0) or 0),
+                             dev.get(channels_key, 0)))
+
+        for p in picks:
+            yield p
+
+    def _set_audio_api_filter(self, preferred=None, show_all=None):
+        """Update the audio API filter and refresh every device picker in the UI."""
+        if preferred is not None:
+            self.audio_preferred_api = preferred
+        if show_all is not None:
+            self.audio_show_all_apis = bool(show_all)
+        # Re-populate every combo that lists devices, preserving selection where possible
+        for combo_name in ("dev_combo", "tx_audio_combo",
+                           "settings_rx_audio_combo", "settings_tx_audio_combo"):
+            combo = getattr(self, combo_name, None)
+            if combo is None:
+                continue
+            try:
+                prev = combo.currentData()
+                # Route through the same helper the individual builders use
+                if "rx" in combo_name or combo_name == "dev_combo":
+                    self._populate_audio_inputs(combo)
+                else:
+                    self._populate_audio_outputs(combo)
+                if prev is not None:
+                    for j in range(combo.count()):
+                        if combo.itemData(j) == prev:
+                            combo.setCurrentIndex(j)
+                            break
+            except Exception:
+                pass
+        # Also refresh the legacy plain-label pickers
+        try:
+            self.load_tx_devices()
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Always-on RX audio level monitor for the Settings-tab meter.
+    # Runs independently of the main receiver so users can see audio arriving
+    # (and adjust gain) without having to start receive.
+    # ─────────────────────────────────────────────────────────────────────────
+    def _start_settings_audio_monitor(self):
+        """Open a lightweight input stream on the currently-selected Settings RX device
+        and pump RMS values into self.settings_rx_meter."""
+        if not HAS_SOUNDDEVICE or sd is None:
+            return
+        # Stop any prior monitor (device switch, filter change, etc.)
+        self._stop_settings_audio_monitor()
+
+        combo = getattr(self, "settings_rx_audio_combo", None)
+        meter = getattr(self, "settings_rx_meter", None)
+        if combo is None or meter is None:
+            return
+        dev = combo.currentData()
+        if dev is None or dev < 0:
+            return
+
+        # Pick a samplerate the device actually supports; fall back to 44100
+        try:
+            info = sd.query_devices(dev)
+            sr = int(info.get("default_samplerate", 44100) or 44100)
+        except Exception:
+            sr = 44100
+
+        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+
+        def _audio_callback(indata, frames, time_info, status):
+            # `status` may be set on xruns; we just ignore and read what we got
+            try:
+                import numpy as np
+                # Use mono mix if multi-channel
+                if indata.ndim > 1 and indata.shape[1] > 1:
+                    samples = indata.mean(axis=1)
+                else:
+                    samples = indata[:, 0] if indata.ndim > 1 else indata
+                # RMS → same 0..100 scaling as the receive-tab meter
+                rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                val = min(max(int(rms * 500), 0), 100)
+                QMetaObject.invokeMethod(
+                    self, "_update_settings_rx_meter",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(int, val),
+                )
+            except Exception:
+                pass
+
+        try:
+            stream = sd.InputStream(
+                device=dev,
+                channels=1,
+                samplerate=sr,
+                blocksize=1024,
+                callback=_audio_callback,
+            )
+            stream.start()
+            self._settings_audio_monitor = stream
+        except Exception as e:
+            # Common cases: device busy on this API, sample rate unsupported.
+            # Silent-ish failure — leave meter at 0, log once so user can diagnose.
+            self._settings_audio_monitor = None
+            try:
+                self._log(f"⚠️ Settings RX monitor: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+    def _stop_settings_audio_monitor(self):
+        stream = getattr(self, "_settings_audio_monitor", None)
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._settings_audio_monitor = None
+
+    @pyqtSlot(int)
+    def _update_settings_rx_meter(self, val):
+        """Slot called from the monitor callback thread via QMetaObject."""
+        if hasattr(self, "settings_rx_meter") and self.settings_rx_meter is not None:
+            try:
+                self.settings_rx_meter.setValue(val)
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Device aliases — right-click any device combo → Rename to give it a
+    # friendly name (e.g. "DigiRig RX"). Aliases persist across restarts and
+    # survive Windows renumbering devices, since we resolve saved selections
+    # by device name (not raw index) at load time.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _alias_get(self, kind, key):
+        """Return the alias for `key` in bucket `kind`, or None if none set."""
+        try:
+            return self.device_aliases.get(kind, {}).get(key) or None
+        except Exception:
+            return None
+
+    def _alias_set(self, kind, key, alias):
+        """Set (or clear if alias is empty) the alias for `key` in bucket `kind`."""
+        if kind not in self.device_aliases:
+            self.device_aliases[kind] = {}
+        alias = (alias or "").strip()
+        if alias:
+            self.device_aliases[kind][key] = alias
+        else:
+            self.device_aliases[kind].pop(key, None)
+        # Save + refresh all combos that might display this alias
+        try:
+            self.save_settings()
+        except Exception:
+            pass
+        self._refresh_all_device_combos()
+
+    def _audio_key(self, dev_name, api_short):
+        """Build the alias-lookup key for an audio device."""
+        return f"{dev_name} [{api_short}]"
+
+    def _audio_combo_key(self, combo):
+        """Given a device combo, return the alias key of its currently-selected item,
+        or None if nothing selectable. Used for name-based persistence."""
+        if combo is None:
+            return None
+        dev_id = combo.currentData()
+        if dev_id is None or dev_id < 0:
+            return None
+        if not HAS_SOUNDDEVICE or sd is None:
+            return None
+        try:
+            info = sd.query_devices(dev_id)
+            apis = list(sd.query_hostapis())
+            api_name = apis[info["hostapi"]]["name"] if 0 <= info.get("hostapi", -1) < len(apis) else "?"
+            api_short = api_name.replace("Windows ", "").replace("DirectSound", "DS").replace("WASAPI", "WAS")
+            return self._audio_key(info["name"], api_short)
+        except Exception:
+            return None
+
+    def _audio_combo_select_by_key(self, combo, key):
+        """Select the item in `combo` whose device matches the alias `key`.
+        Returns True if a match was found and selected."""
+        if not key or combo is None:
+            return False
+        if not HAS_SOUNDDEVICE or sd is None:
+            return False
+        try:
+            apis = list(sd.query_hostapis())
+        except Exception:
+            return False
+        for i in range(combo.count()):
+            dev_id = combo.itemData(i)
+            if dev_id is None or dev_id < 0:
+                continue
+            try:
+                info = sd.query_devices(dev_id)
+                api_name = apis[info["hostapi"]]["name"] if 0 <= info.get("hostapi", -1) < len(apis) else "?"
+                api_short = api_name.replace("Windows ", "").replace("DirectSound", "DS").replace("WASAPI", "WAS")
+                if self._audio_key(info["name"], api_short) == key:
+                    combo.setCurrentIndex(i)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _decorate_alias(self, alias, raw_label):
+        """Format an alias with the raw label after, e.g. '⭐ DigiRig RX  ·  0: USB Audio…'"""
+        if alias:
+            return f"⭐ {alias}  ·  {raw_label}"
+        return raw_label
+
+    def _refresh_all_device_combos(self):
+        """Repopulate every device picker so alias changes appear everywhere at once.
+        Preserves each combo's current selection where possible."""
+        combo_map = {
+            # attribute name → (populator, restore-by)
+            "settings_rx_audio_combo": ("audio_in", None),
+            "settings_tx_audio_combo": ("audio_out", None),
+            "dev_combo":               ("audio_in", None),
+            "tx_audio_combo":          ("audio_out", None),
+            "settings_ptt_combo":      ("serial", None),
+            "settings_gps_combo":      ("serial", None),
+        }
+        for name, (kind, _) in combo_map.items():
+            combo = getattr(self, name, None)
+            if combo is None:
+                continue
+            try:
+                prev = combo.currentData()
+                if kind == "audio_in":
+                    self._populate_audio_inputs(combo)
+                elif kind == "audio_out":
+                    self._populate_audio_outputs(combo)
+                else:
+                    self._populate_serial_combo(combo)
+                if prev is not None:
+                    for j in range(combo.count()):
+                        if combo.itemData(j) == prev:
+                            combo.setCurrentIndex(j)
+                            break
+            except Exception:
+                pass
+
+    def _bind_device_context_menu(self, combo, kind):
+        """Wire a right-click context menu onto a device combo.
+
+        kind: 'audio_input' | 'audio_output' | 'serial'
+        The menu lets the user rename or clear the alias for the *currently selected*
+        item, and copy the raw device name/port to the clipboard.
+        """
+        try:
+            combo.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+            def _key_for_current():
+                """Return the alias key for the combo's current item."""
+                idx = combo.currentIndex()
+                if idx < 0:
+                    return None, None
+                if kind == "serial":
+                    port = combo.currentData()
+                    if not port:
+                        return None, None
+                    return port, port
+                # Audio: resolve device_id → (name, api) → key
+                dev_id = combo.currentData()
+                if dev_id is None or dev_id < 0:
+                    return None, None
+                if not HAS_SOUNDDEVICE or sd is None:
+                    return None, None
+                try:
+                    info = sd.query_devices(dev_id)
+                    apis = list(sd.query_hostapis())
+                    api_name = apis[info["hostapi"]]["name"] if 0 <= info.get("hostapi", -1) < len(apis) else "?"
+                    api_short = api_name.replace("Windows ", "").replace("DirectSound", "DS").replace("WASAPI", "WAS")
+                    key = self._audio_key(info["name"], api_short)
+                    display = info["name"]
+                    return key, display
+                except Exception:
+                    return None, None
+
+            def _open_menu(pos):
+                from PyQt6.QtWidgets import QMenu, QInputDialog, QApplication
+                key, display = _key_for_current()
+                menu = QMenu(combo)
+                if key is None:
+                    act = menu.addAction("(no device selected)")
+                    act.setEnabled(False)
+                else:
+                    current_alias = self._alias_get(kind, key) or ""
+                    rename_label = "✏️ Rename…" if not current_alias else f"✏️ Rename (currently: {current_alias})"
+                    rename_act = menu.addAction(rename_label)
+                    clear_act = menu.addAction("🗑 Clear alias")
+                    clear_act.setEnabled(bool(current_alias))
+                    menu.addSeparator()
+                    copy_act = menu.addAction("📋 Copy device name")
+
+                    def _rename():
+                        new_alias, ok = QInputDialog.getText(
+                            self, "Rename device",
+                            f"Alias for:\n{display}\n\nLeave blank to clear.",
+                            text=current_alias,
+                        )
+                        if ok:
+                            self._alias_set(kind, key, new_alias)
+
+                    def _clear():
+                        self._alias_set(kind, key, "")
+
+                    def _copy():
+                        QApplication.clipboard().setText(display or key)
+
+                    rename_act.triggered.connect(_rename)
+                    clear_act.triggered.connect(_clear)
+                    copy_act.triggered.connect(_copy)
+
+                menu.exec(combo.mapToGlobal(pos))
+
+            combo.customContextMenuRequested.connect(_open_menu)
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Air Quality Index (AQI) — AirNow Current Forecasts by Lat/Long
+    # https://docs.airnowapi.org/  — endpoint: /aq/forecast/current/
+    # Built against the June 2026 API (replaces the retiring
+    # /aq/forecast/latLong/ endpoint retiring 2026-09-30).
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # EPA AQI category → (color, dark-text-on-light? boolean)
+    _AQI_CATEGORY_COLORS = {
+        1: ("#00e400", True,  "Good"),
+        2: ("#ffff00", True,  "Moderate"),
+        3: ("#ff7e00", False, "Unhealthy for Sensitive Groups"),
+        4: ("#ff0000", False, "Unhealthy"),
+        5: ("#8f3f97", False, "Very Unhealthy"),
+        6: ("#7e0023", False, "Hazardous"),
+        7: ("#808080", False, "Unavailable"),
+    }
+
+    def _toggle_aqi_monitor(self, state):
+        """Settings-tab 'Show' checkbox for AQI. Enables refresh button + starts
+        an auto-refresh timer while enabled."""
+        enabled = bool(state)
+        if hasattr(self, "aqi_refresh_btn"):
+            self.aqi_refresh_btn.setEnabled(enabled)
+        # Sync the receive-tab quick toggle without recursing
+        if hasattr(self, "rx_aqi_check"):
+            try:
+                self.rx_aqi_check.blockSignals(True)
+                self.rx_aqi_check.setChecked(enabled)
+                self.rx_aqi_check.blockSignals(False)
+            except Exception:
+                pass
+        if enabled:
+            self._aqi_start_auto_refresh()
+            # Fetch once immediately so user sees data without waiting for the timer
+            self._fetch_aqi_data()
+        else:
+            self._aqi_stop_auto_refresh()
+            self._aqi_clear_map()
+            if hasattr(self, "aqi_status"):
+                self.aqi_status.setText("⚫ off")
+                self.aqi_status.setStyleSheet("color:#666; font-size:10px;")
+
+    def _rx_toggle_aqi(self, state):
+        """Receive-tab '💨 AQI' quick toggle. Delegates to the same settings-tab
+        toggle so the two stay in sync."""
+        enabled = bool(state)
+        if hasattr(self, "aqi_enabled"):
+            try:
+                self.aqi_enabled.blockSignals(True)
+                self.aqi_enabled.setChecked(enabled)
+                self.aqi_enabled.blockSignals(False)
+            except Exception:
+                pass
+        # Reuse the same enable/disable logic
+        self._toggle_aqi_monitor(enabled)
+
+    def _aqi_start_auto_refresh(self):
+        """Start (or restart) the hourly AQI auto-refresh timer.
+
+        AirNow rate-limits at 500 requests/hour. Refreshing hourly on a single
+        location is trivially under that limit even with several users on one key.
+        """
+        try:
+            if getattr(self, "_aqi_timer", None) is None:
+                self._aqi_timer = QTimer(self)
+                self._aqi_timer.timeout.connect(self._fetch_aqi_data)
+            self._aqi_timer.start(60 * 60 * 1000)  # 1 hour
+        except Exception:
+            pass
+
+    def _aqi_stop_auto_refresh(self):
+        try:
+            if getattr(self, "_aqi_timer", None) is not None:
+                self._aqi_timer.stop()
+        except Exception:
+            pass
+
+    def _fetch_aqi_data(self):
+        """Fetch current-day AQI forecast for the user's beacon lat/lon from AirNow."""
+        api_key = self.aqi_api_key.text().strip() if hasattr(self, "aqi_api_key") else ""
+        if not api_key:
+            self._aqi_set_status("⚠️ API key required — get one at airnowapi.org", "#ffb74d")
+            return
+
+        # Beacon lat/lon is the source of truth for "here"
+        try:
+            lat = float(self.lat_edit.value())
+            lon = float(self.lon_edit.value())
+        except Exception:
+            self._aqi_set_status("⚠️ Set beacon lat/lon first", "#ffb74d")
+            return
+
+        # Build URL — new endpoint per June 2026 update
+        params = (
+            f"latitude={lat:.4f}"
+            f"&longitude={lon:.4f}"
+            f"&format=application/json"
+            f"&api_key={api_key}"
+        )
+        url = f"https://www.airnowapi.org/aq/forecast/current/?{params}"
+
+        self._aqi_set_status("⏳ fetching…", "#64b5f6")
+        self._log(f"💨 AQI: fetching AirNow forecast for {lat:.4f},{lon:.4f}")
+
+        # Reuse NetworkFetchWorker for the actual request (background thread + signals)
+        try:
+            worker = NetworkFetchWorker(url, headers={"User-Agent": "PyTNC-Pro/0.1.8"}, timeout=20)
+            worker.signals.finished.connect(self._on_aqi_response)
+            worker.signals.error.connect(self._on_aqi_error)
+            QThreadPool.globalInstance().start(worker)
+        except Exception as e:
+            self._on_aqi_error(f"worker start: {e}")
+
+    def _on_aqi_response(self, data):
+        """Slot for successful AQI response. `data` is a list of forecast entries
+        (one per pollutant per day). We pick the worst (highest AQI) entry for
+        today's date and render it."""
+        # Empty responses are common when the location has no monitoring stations
+        if not data or not isinstance(data, list):
+            self._aqi_set_status("○ no AQI data for this location", "#888")
+            self._aqi_clear_map()
+            return
+
+        import datetime
+        today = datetime.date.today().isoformat()
+
+        # Prefer today's forecast; fall back to first available
+        today_entries = [e for e in data if isinstance(e, dict) and e.get("dateValid") == today]
+        pool = today_entries if today_entries else [e for e in data if isinstance(e, dict)]
+        if not pool:
+            self._aqi_set_status("○ no forecast entries", "#888")
+            self._aqi_clear_map()
+            return
+
+        # Pick worst (highest AQI) entry. Categorical-only forecasts report aqi=-1;
+        # if we only got those, fall back to the highest category number.
+        with_aqi = [e for e in pool if isinstance(e.get("aqi"), (int, float)) and e["aqi"] >= 0]
+        if with_aqi:
+            worst = max(with_aqi, key=lambda e: e["aqi"])
+        else:
+            worst = max(pool, key=lambda e: (e.get("categoryNumber") or 0))
+
+        # Build display
+        cat_num = int(worst.get("categoryNumber") or 7)
+        color, dark_text, cat_name_default = self._AQI_CATEGORY_COLORS.get(cat_num, self._AQI_CATEGORY_COLORS[7])
+        cat_name = worst.get("categoryName") or cat_name_default
+        aqi_val = worst.get("aqi")
+        aqi_str = str(int(aqi_val)) if isinstance(aqi_val, (int, float)) and aqi_val >= 0 else "—"
+        pollutant = worst.get("parameterName") or "?"
+        area = worst.get("reportingArea") or ""
+        action_day = bool(worst.get("actionDay"))
+        discussion = (worst.get("discussion") or "").strip()
+
+        # Status label (compact colored badge with AQI + category + pollutant)
+        badge = f"AQI {aqi_str} · {cat_name} · {pollutant}"
+        if action_day:
+            badge += " · ⚠️ Action Day"
+        status_style = (
+            f"background:{color}; color:{'#000' if dark_text else '#fff'}; "
+            f"padding:2px 6px; border-radius:3px; font-size:10px; font-weight:bold;"
+        )
+        if hasattr(self, "aqi_status"):
+            self.aqi_status.setText(badge)
+            self.aqi_status.setStyleSheet(status_style)
+
+        # Cache for map + tooltip
+        self._aqi_last = {
+            "aqi": aqi_str,
+            "category_num": cat_num,
+            "category_name": cat_name,
+            "color": color,
+            "pollutant": pollutant,
+            "area": area,
+            "action_day": action_day,
+            "discussion": discussion,
+            "date": worst.get("dateValid"),
+            "agency": worst.get("forecastAgency", ""),
+        }
+
+        self._log(f"💨 AQI: {badge}  ({area})")
+
+        # Push to map if the AQI layer is currently enabled
+        if hasattr(self, "aqi_enabled") and self.aqi_enabled.isChecked():
+            try:
+                lat = float(self.lat_edit.value())
+                lon = float(self.lon_edit.value())
+                self._apply_aqi_to_map(lat, lon)
+            except Exception as e:
+                self._log(f"💨 AQI: map update failed: {e}")
+
+    def _on_aqi_error(self, err):
+        """Slot for AQI HTTP errors."""
+        self._aqi_set_status(f"❌ AQI error", "#ef5350")
+        self._log(f"💨 AQI: {err}")
+
+    def _aqi_set_status(self, text, color):
+        if hasattr(self, "aqi_status") and self.aqi_status is not None:
+            self.aqi_status.setText(text)
+            self.aqi_status.setStyleSheet(f"color:{color}; font-size:10px;")
+
+    def _apply_aqi_to_map(self, lat, lon):
+        """Render an AQI marker on the Leaflet map at (lat, lon).
+
+        Uses the app's existing queueStation() JS bridge (proven, safe timing) with a
+        data-URI colored-circle SVG as the icon. This avoids raw L.circleMarker calls
+        that can fire before Leaflet's `map` variable is in scope.
+        """
+        info = getattr(self, "_aqi_last", None)
+        if not info:
+            return
+        if not hasattr(self, "map") or self.map is None:
+            return
+
+        import json
+        import urllib.parse
+
+        color = info["color"]
+        aqi = info["aqi"]
+        cat_num = info.get("category_num", 7)
+        # Text color: dark on light-color categories (Good/Moderate), else white
+        dark_text = cat_num in (1, 2)
+        text_color = "#000" if dark_text else "#fff"
+
+        # Small SVG "AQI ##" badge — data URI so no server hit needed
+        svg = (
+            f"<svg xmlns='http://www.w3.org/2000/svg' width='38' height='38'>"
+            f"<circle cx='19' cy='19' r='16' fill='{color}' stroke='white' "
+            f"stroke-width='2.5' opacity='0.9'/>"
+            f"<text x='19' y='23' text-anchor='middle' "
+            f"font-family='Arial,sans-serif' font-size='11' font-weight='bold' "
+            f"fill='{text_color}'>{aqi}</text>"
+            f"</svg>"
+        )
+        icon_url = "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
+
+        # Popup / tooltip HTML — queueStation passes this into Leaflet's tooltip/popup
+        tip_bits = [
+            f"<b>AQI {aqi}</b> — {info['category_name']}",
+            f"Pollutant: {info['pollutant']}",
+        ]
+        if info.get("area"):
+            tip_bits.append(f"Area: {info['area']}")
+        if info.get("action_day"):
+            tip_bits.append("<span style='color:#ff0000;'>⚠️ Action Day</span>")
+        if info.get("agency"):
+            tip_bits.append(f"<i>{info['agency']}</i>")
+        if info.get("discussion"):
+            disc = info["discussion"].replace("\r", " ").replace("\n", " ").strip()
+            if len(disc) > 240:
+                disc = disc[:237] + "…"
+            tip_bits.append(f"<hr style='margin:4px 0'><small>{disc}</small>")
+        tooltip = "<br>".join(tip_bits)
+
+        # Use the same helper every other feature uses to place markers.
+        # Signature (per app convention): queueStation(name, lat, lon, iconUrl, tooltip, isDynamic, extraHtml)
+        name = f"AQI@{lat:.3f},{lon:.3f}"
+        js = f"queueStation({json.dumps(name)},{lat},{lon},{json.dumps(icon_url)},{json.dumps(tooltip)},false,\"\")"
+        try:
+            self.map.page().runJavaScript(js)
+        except Exception as e:
+            self._log(f"💨 AQI map JS error: {e}")
+
+    def _aqi_clear_map(self):
+        """Best-effort removal of the AQI marker. queueStation-added markers live in
+        the same station store as APRS stations; there's no per-marker remove helper
+        exposed, so on toggle-off we simply overwrite the badge with a transparent
+        one (same name = same slot in the station store). If a `removeStation` or
+        similar helper is added later, this can call that instead."""
+        import json, urllib.parse
+        try:
+            lat = float(self.lat_edit.value())
+            lon = float(self.lon_edit.value())
+        except Exception:
+            return
+        if not hasattr(self, "map") or self.map is None:
+            return
+        # 1×1 transparent SVG to visually erase the badge without disturbing other markers
+        blank = "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'></svg>"
+        icon_url = "data:image/svg+xml;utf8," + urllib.parse.quote(blank)
+        name = f"AQI@{lat:.3f},{lon:.3f}"
+        js = f"queueStation({json.dumps(name)},{lat},{lon},{json.dumps(icon_url)},\"\",false,\"\")"
+        try:
+            self.map.page().runJavaScript(js)
+        except Exception:
+            pass
+
     def _on_path_changed(self, path_text):
         """Handle PATH combo change - informational only now"""
         # Note: VARA FM has its own path field, so we don't disable VARA buttons
@@ -4463,36 +6055,46 @@ class MainWindow(MonitorsMixin, QMainWindow):
             self.vara_tx_indicator.setStyleSheet("color: #69f0ae; font-weight: bold;")
     
     def _vara_send_chat(self):
-        """Send chat message over VARA FM connection"""
-        if not self.vara_connected or not self.vara_data_socket:
-            self._vara_log("❌ Not connected!")
+        """Send a chat message over the current VARA P2P link."""
+        if not (self.vara_connected and self.vara_data_socket):
+            self._vara_chat_set_status("❌ VARA not connected", "#ef5350")
             return
-        
+        if not self._vara_is_connected_to_remote:
+            self._vara_chat_set_status("❌ Not linked — click Link first", "#ef5350")
+            return
+
         msg = self.vara_send_edit.text().strip()
         if not msg:
             return
-        
+
+        remote = (self.vara_remote_call or self.vara_chat_target.text().strip().upper())
+        if not remote:
+            self._vara_chat_set_status("❌ Unknown remote callsign", "#ef5350")
+            return
+
         try:
-            mycall = self.callsign_edit.text().strip().upper() or "MYCALL"
-            # Send message with newline
             data = (msg + "\r\n").encode()
             self.vara_data_socket.send(data)
             self.vara_bytes_sent += len(data)
-            
-            # Display in chat with our callsign
-            self.vara_chat.append(f"<span style='color:#64b5f6'>>{mycall}</span>")
-            self.vara_chat.append(f"<span style='color:#ffffff'>{msg}</span>")
-            
-            # Update byte counter
-            self.vara_bytes_label.setText(f"📤 {self.vara_bytes_sent} bytes")
-            
+
+            self._vara_chat_append(remote, "tx", msg)
+
+            if hasattr(self, "vara_bytes_label"):
+                self.vara_bytes_label.setText(f"📤 {self.vara_bytes_sent} bytes")
+
             self.vara_send_edit.clear()
-            self._vara_update_tx_indicator(True)
-            
-            # Reset to RX after short delay
-            QTimer.singleShot(500, lambda: self._vara_update_tx_indicator(False))
-            
+            # TX indicator is purely cosmetic — don't let it abort the send
+            try:
+                if hasattr(self, "_vara_update_tx_indicator"):
+                    self._vara_update_tx_indicator(True)
+                    QTimer.singleShot(500, lambda: self._vara_update_tx_indicator(False))
+            except Exception:
+                pass
+
+            # Clear any prior error status — the send succeeded
+            self._vara_chat_set_status(f"● linked to {remote}", "#69f0ae")
         except Exception as e:
+            self._vara_chat_set_status(f"❌ Send error: {e}", "#ef5350")
             self._vara_log(f"❌ Send error: {e}")
     
     def _vara_send_beacon(self):
@@ -4711,10 +6313,19 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     
                     rx_buffer += text
                     
-                    # Log raw chunk for debugging
-                    QMetaObject.invokeMethod(self, "_vara_log_rx",
-                                            Qt.ConnectionType.QueuedConnection,
-                                            Q_ARG(str, f"[{len(text)}b] {text.strip()[:60]}"))
+                    # Log raw chunk for debugging — in debug mode also show first hex bytes
+                    # so the user can spot non-printable framing
+                    debug = bool(getattr(self, "vara_debug_enabled", False))
+                    preview = text.strip()[:60]
+                    if debug:
+                        hex_preview = " ".join(f"{b:02x}" for b in data[:16])
+                        QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                Qt.ConnectionType.QueuedConnection,
+                                                Q_ARG(str, f"DATA RX [{len(data)}b]: {preview!r}  hex: {hex_preview}"))
+                    else:
+                        QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                Qt.ConnectionType.QueuedConnection,
+                                                Q_ARG(str, f"[{len(text)}b] {preview}"))
                     
                     # Process complete lines (APRS packets end with CR or CRLF)
                     # Split on \r or \n, handling both \r\n and bare \r
@@ -4739,7 +6350,15 @@ class MainWindow(MonitorsMixin, QMainWindow):
                         line = line.strip()
                         if not line:
                             continue
-                        
+
+                        # If we're in an active VARA P2P session, every incoming line is chat,
+                        # regardless of whether it happens to look APRS-shaped.
+                        if self._vara_is_connected_to_remote:
+                            QMetaObject.invokeMethod(self, "_vara_chat_rx_line",
+                                                    Qt.ConnectionType.QueuedConnection,
+                                                    Q_ARG(str, line))
+                            continue
+
                         # Check if this looks like an APRS packet (CALL>DEST:info)
                         if '>' in line and ':' in line:
                             gt_pos = line.find('>')
@@ -4789,6 +6408,14 @@ class MainWindow(MonitorsMixin, QMainWindow):
         """Background thread to listen for VARA FM command events"""
         from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
         
+        # Diagnostic counters tracked across the loop
+        ptt_cycles = 0
+        last_ptt_state = None
+        last_bitrate = None
+        last_state_change_ts = time.time()
+        last_summary_ts = time.time()
+        debug = bool(getattr(self, "vara_debug_enabled", False))
+        
         while self.vara_rx_running and self.vara_cmd_socket:
             try:
                 self.vara_cmd_socket.settimeout(0.5)
@@ -4800,10 +6427,57 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     
                     for line in text.split('\r'):
                         line = line.strip()
-                        if not line or line in ("BUSY ON", "BUSY OFF", "IAMALIVE"):
+                        if not line:
                             continue
                         
-                        # Log non-noisy events
+                        # Refresh debug toggle per-line in case user flipped it
+                        debug = bool(getattr(self, "vara_debug_enabled", False))
+                        
+                        # In normal mode, suppress noisy keep-alives. In debug, surface them.
+                        if line in ("BUSY ON", "BUSY OFF", "IAMALIVE"):
+                            if debug:
+                                QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                        Qt.ConnectionType.QueuedConnection,
+                                                        Q_ARG(str, f"CMD[noise]: {line}"))
+                            continue
+                        
+                        # Tag PTT cycles distinctly so the user can spot ARQ retries.
+                        if line.startswith("PTT "):
+                            ptt_cycles += 1
+                            if last_ptt_state != line:
+                                last_ptt_state = line
+                            # In debug, log every PTT toggle with cycle count
+                            if debug:
+                                QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                        Qt.ConnectionType.QueuedConnection,
+                                                        Q_ARG(str, f"CMD: {line}  [cycle #{ptt_cycles}]"))
+                            else:
+                                # Even in normal mode, surface PTT every few cycles so the
+                                # user sees the link is hot but log isn't drowned.
+                                QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                        Qt.ConnectionType.QueuedConnection,
+                                                        Q_ARG(str, f"CMD: {line}"))
+                            continue
+                        
+                        # Track bitrate changes (VARA reports these on link establishment
+                        # and during quality adaptation — useful diagnostic signal)
+                        if line.startswith("BITRATE"):
+                            last_bitrate = line
+                            QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                    Qt.ConnectionType.QueuedConnection,
+                                                    Q_ARG(str, f"📊 {line}"))
+                            continue
+                        
+                        # Buffer level (TX queue) — useful to see if VARA is stuck waiting
+                        # to send something or has cleared its queue
+                        if line.startswith("BUFFER"):
+                            if debug:
+                                QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                                        Qt.ConnectionType.QueuedConnection,
+                                                        Q_ARG(str, f"📦 {line}"))
+                            continue
+                        
+                        # Default: log every non-noise CMD line
                         QMetaObject.invokeMethod(self, "_vara_log_rx",
                                                 Qt.ConnectionType.QueuedConnection,
                                                 Q_ARG(str, f"CMD: {line}"))
@@ -4813,30 +6487,55 @@ class MainWindow(MonitorsMixin, QMainWindow):
                             parts = line.split()
                             if len(parts) >= 3:
                                 self._vara_is_connected_to_remote = True
+                                remote = parts[2]
+                                # Reset diagnostic counters for the new session
+                                ptt_cycles = 0
+                                last_state_change_ts = time.time()
                                 QMetaObject.invokeMethod(self, "_vara_log_rx",
                                                         Qt.ConnectionType.QueuedConnection,
-                                                        Q_ARG(str, f"🔗 Connected to {parts[2]}"))
-                        
-                        elif line.startswith("REGISTERED ") or line == "LINK REGISTERED":
-                            self._vara_is_connected_to_remote = True
-                        
+                                                        Q_ARG(str, f"🔗 Connected to {remote}  (bandwidth: {parts[3] if len(parts) > 3 else '?'}, bitrate: {last_bitrate or '?'})"))
+                                QMetaObject.invokeMethod(self, "_vara_chat_on_connected",
+                                                        Qt.ConnectionType.QueuedConnection,
+                                                        Q_ARG(str, remote))
+
+                        # NOTE: REGISTERED is a callsign-registration ack from VARA, NOT a P2P link.
+                        # Do NOT flip _vara_is_connected_to_remote on REGISTERED — only on CONNECTED.
+
                         elif line == "DISCONNECTED":
                             self._vara_is_connected_to_remote = False
                             QMetaObject.invokeMethod(self, "_vara_log_rx",
                                                     Qt.ConnectionType.QueuedConnection,
                                                     Q_ARG(str, "📴 Disconnected"))
-                        
+                            QMetaObject.invokeMethod(self, "_vara_chat_on_disconnected",
+                                                    Qt.ConnectionType.QueuedConnection)
+
                         elif line.startswith("RING"):
                             caller = line.replace("RING", "").strip()
                             QMetaObject.invokeMethod(self, "_vara_log_rx",
                                                     Qt.ConnectionType.QueuedConnection,
                                                     Q_ARG(str, f"📞 Incoming call: {caller}"))
+                            # Auto-accept: send back CONNECT to acknowledge the link
+                            QMetaObject.invokeMethod(self, "_vara_chat_on_ring",
+                                                    Qt.ConnectionType.QueuedConnection,
+                                                    Q_ARG(str, caller))
                         
-                        # Track PTT
-                        elif line == "PTT ON":
+                        # Track PTT (counter already incremented above; this maintains the flag)
+                        if line == "PTT ON":
                             self._vara_ptt_active = True
                         elif line == "PTT OFF":
                             self._vara_ptt_active = False
+                
+                # Periodic summary: while linked and PTT cycling, every 10s log a status line
+                # so the user can quickly see "still trying for X seconds, no progress"
+                now_ts = time.time()
+                if (self._vara_is_connected_to_remote
+                        and ptt_cycles > 4
+                        and (now_ts - last_summary_ts) >= 10.0):
+                    secs = int(now_ts - last_state_change_ts)
+                    QMetaObject.invokeMethod(self, "_vara_log_rx",
+                                            Qt.ConnectionType.QueuedConnection,
+                                            Q_ARG(str, f"⏱ Link active {secs}s · {ptt_cycles} PTT cycles · last bitrate: {last_bitrate or '?'}"))
+                    last_summary_ts = now_ts
                             
             except socket.timeout:
                 continue
@@ -4860,7 +6559,78 @@ class MainWindow(MonitorsMixin, QMainWindow):
     def _log_vara_rx(self, msg):
         """Thread-safe logging for VARA RX (called via QMetaObject)"""
         self._log(msg)
-    
+
+    @pyqtSlot(str)
+    def _vara_chat_rx_line(self, line):
+        """Handle a single received chat line (called from RX thread via QMetaObject).
+
+        Appends the line to the current remote's chat log and refreshes the chat view.
+        """
+        remote = (self.vara_remote_call or self.vara_chat_target.text().strip().upper())
+        if not remote:
+            # Fall through to plain log if we somehow received chat without knowing the peer
+            self._vara_log(f"💬 (no peer) {line}")
+            return
+        self.vara_bytes_recv += len(line) + 2
+        if hasattr(self, "vara_bytes_label"):
+            self.vara_bytes_label.setText(f"📤 {self.vara_bytes_sent} bytes  📥 {self.vara_bytes_recv} bytes")
+        self._vara_chat_append(remote, "rx", line)
+        # Flash the VARA tab title if user isn't already looking at it
+        try:
+            current = self.tabs.currentIndex()
+            vara_tab_idx = self._find_vara_tab_index()
+            if vara_tab_idx is not None and current != vara_tab_idx:
+                self.tabs.setTabText(vara_tab_idx, "📡 VARA FM 💬*")
+        except Exception:
+            pass
+
+    @pyqtSlot(str)
+    def _vara_chat_on_connected(self, remote):
+        """Slot fired when CONNECTED <a> <b> arrives — update the chat UI to linked state."""
+        if not remote:
+            return
+        self.vara_remote_call = remote
+        self._vara_chat_set_linked_ui(True, remote=remote)
+        self._vara_chat_append(remote, "sys", f"Linked to {remote}")
+
+    @pyqtSlot()
+    def _vara_chat_on_disconnected(self):
+        """Slot fired when DISCONNECTED arrives — drop chat UI to idle."""
+        prev = self.vara_remote_call
+        self._vara_chat_set_linked_ui(False)
+        if prev:
+            self._vara_chat_append(prev, "sys", f"Unlinked from {prev}")
+        self.vara_remote_call = None
+
+    @pyqtSlot(str)
+    def _vara_chat_on_ring(self, caller):
+        """Slot fired on incoming RING — log/UI only.
+
+        VARA's `LISTEN ON` (set during daemon connect) accepts inbound links automatically
+        at the protocol level. The host MUST NOT issue any command in response to RING,
+        otherwise it can collide with the in-flight handshake (e.g. firing CONNECT back
+        makes VARA think we want a new outbound link, breaking the current acceptance).
+
+        We just surface the incoming-call notification in the UI and wait for the
+        CONNECTED event from VARA to mark ourselves linked.
+        """
+        if not caller:
+            return
+        self._vara_chat_set_status(f"📞 incoming call from {caller}…", "#64b5f6")
+        self._vara_chat_append(caller, "sys", f"Incoming call from {caller} — auto-accepting via LISTEN ON")
+        self._vara_log(f"📞 RING {caller} (auto-accepted by VARA)")
+
+    def _find_vara_tab_index(self):
+        """Locate the VARA FM tab index by name (in case order changes)."""
+        try:
+            for i in range(self.tabs.count()):
+                t = self.tabs.tabText(i)
+                if "VARA FM" in t:
+                    return i
+        except Exception:
+            pass
+        return None
+
     @pyqtSlot(str, str, str)
     def _process_vara_aprs(self, src_call: str, dest_call: str, info: str):
         """Parse APRS packet from VARA FM and add to map"""
@@ -5901,97 +7671,76 @@ class MainWindow(MonitorsMixin, QMainWindow):
     # =========================================================================
     
     def _refresh_message_history(self):
-        """Refresh the message history display"""
-        self.msg_history.clear()
-        if not self.current_conv or self.current_conv not in self.conversations:
+        """Render the compact flat APRS message log into self.msg_history.
+
+        Shows every message across all conversations, newest-last, with status icons:
+            ✓     = received OR outgoing acked
+            ⏳     = outgoing pending ack
+            ✗     = outgoing failed
+            ✓ack# = outgoing message that was acked, showing seq
+        """
+        if not hasattr(self, "msg_history") or self.msg_history is None:
             return
+        self.msg_history.clear()
 
-        my_call = f"{self.callsign_edit.text().strip().upper()}-{self.ssid_combo.currentData()}"
+        my_call = self.callsign_edit.text().strip().upper()
+        my_ssid = self.ssid_combo.currentData() or 0
+        my_full = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
 
-        # Mark all incoming messages in this conversation as read
-        for msg in self.conversations[self.current_conv]:
-            if msg.get("from") != my_call:
-                msg["read"] = True
+        # Flatten all messages, sort by ts_iso (fallback to time string)
+        flat = []
+        for callsign, msgs in self.conversations.items():
+            for m in msgs:
+                flat.append(m)
+        flat.sort(key=lambda m: m.get("ts_iso") or m.get("time") or "")
 
-        # Clear tab badge if no other unread conversations
-        total_unread = sum(
-            1 for msgs in self.conversations.values()
-            for m in msgs
-            if m.get("from") != my_call and not m.get("read")
-        )
-        if total_unread == 0:
-            self.tabs.setTabText(2, "💬 Messages")
-        
-        html = ""
-        for msg in self.conversations[self.current_conv]:
-            time_str = msg.get("time", "")
-            text = msg.get("text", "")
-            
-            if msg.get("from") == my_call:
-                # Outgoing message (right aligned, blue)
-                ack_icon = "✓" if msg.get("acked") else "⏳"
-                html += f'''<div style="text-align: right; margin: 5px;">
-                    <span style="background: #1565c0; color: white; padding: 5px 10px; border-radius: 10px; display: inline-block;">
-                    {text}</span><br>
-                    <span style="color: #607d8b; font-size: 10px;">{time_str} {ack_icon}</span>
-                </div>'''
+        # Show the most-recent 100 — plenty of room in the right-panel half
+        flat = flat[-100:]
+
+        html_lines = []
+        for m in flat:
+            t = m.get("time", "")
+            src = m.get("from", "")
+            dst = m.get("to", "")
+            text = (m.get("text") or "").replace("<", "&lt;").replace(">", "&gt;")
+            seq = m.get("seq")
+            transport = m.get("transport", "")
+
+            outgoing = (src == my_full)
+            if outgoing:
+                if m.get("acked"):
+                    status = f"<span style='color:#69f0ae;'>✓{('ack ' + seq) if seq else ''}</span>"
+                elif seq:
+                    status = "<span style='color:#ffb74d;'>⏳</span>"
+                else:
+                    status = "<span style='color:#80cbc4;'>✓</span>"
             else:
-                # Incoming message (left aligned, gray)
-                html += f'''<div style="text-align: left; margin: 5px;">
-                    <span style="background: #37474f; color: white; padding: 5px 10px; border-radius: 10px; display: inline-block;">
-                    {text}</span><br>
-                    <span style="color: #607d8b; font-size: 10px;">{time_str}</span>
-                </div>'''
-        
-        self.msg_history.setHtml(html)
-        # Scroll to bottom
-        scrollbar = self.msg_history.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-    
+                # Incoming — always acknowledged from receiver's POV
+                status = "<span style='color:#80cbc4;'>•</span>"
+
+            tx_marker = ""
+            if transport == "is":
+                tx_marker = " <span style='color:#42a5f5;'>[IS]</span>"
+            elif transport == "rf":
+                tx_marker = " <span style='color:#ffb74d;'>[RF]</span>"
+
+            html_lines.append(
+                f"<span style='color:#607d8b;'>[{t}]</span> "
+                f"<span style='color:#ffd54f;'>{src}</span>"
+                f"<span style='color:#607d8b;'>&gt;</span>"
+                f"<span style='color:#80cbc4;'>{dst}</span>"
+                f"<span style='color:#607d8b;'>:</span> "
+                f"<span style='color:#e0f7fa;'>{text}</span> {status}{tx_marker}"
+            )
+
+        self.msg_history.setHtml("<br>".join(html_lines))
+        sb = self.msg_history.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _update_conversation_list(self):
-        """Update the conversations list widget"""
-        self.conv_list.clear()
-        my_call = f"{self.callsign_edit.text().strip().upper()}-{self.ssid_combo.currentData()}"
-
-        for callsign, messages in sorted(
-            self.conversations.items(),
-            key=lambda kv: kv[1][-1].get("time", "") if kv[1] else "",
-            reverse=True
-        ):
-            if not messages:
-                continue
-
-            last_msg = messages[-1]
-            preview = last_msg.get("text", "")[:25]
-            if len(last_msg.get("text", "")) > 25:
-                preview += "\u2026"
-            time_str = last_msg.get("time", "")
-
-            # Count unread incoming
-            unread = sum(
-                1 for m in messages
-                if m.get("from") != my_call and not m.get("read")
-            )
-            has_unacked = any(
-                not m.get("acked") and m.get("from") == my_call
-                for m in messages
-            )
-
-            badge    = f" \U0001f534{unread}" if unread > 0 else ""
-            ack_warn = " \u23f3" if has_unacked else ""
-            display  = f"{callsign}{badge}{ack_warn}\n{time_str}  {preview}"
-
-            item = QListWidgetItem(display)
-            item.setData(Qt.ItemDataRole.UserRole, callsign)
-
-            if unread > 0:
-                item.setForeground(QColor("#69f0ae"))
-            elif has_unacked:
-                item.setForeground(QColor("#ffb74d"))
-            else:
-                item.setForeground(QColor("#b0bec5"))
-
-            self.conv_list.addItem(item)
+        """Compatibility shim — kept for callers; refreshes the Recent dropdown."""
+        if hasattr(self, "_msg_refresh_recent_menu"):
+            self._msg_refresh_recent_menu()
     
     def _save_conversations(self):
         """Save conversations to JSON file"""
@@ -6003,80 +7752,126 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 }, f, indent=2)
         except Exception as e:
             self._log(f"⚠️ Failed to save conversations: {e}")
+
+    def _load_conversations(self):
+        """Load conversations from JSON file (called once during init)."""
+        try:
+            if not self.conversations_file.exists():
+                return
+            with open(self.conversations_file, 'r') as f:
+                data = json.load(f)
+            self.conversations = data.get("conversations", {}) or {}
+            self.msg_seq = int(data.get("msg_seq", 0) or 0)
+            total = sum(len(v) for v in self.conversations.values())
+            if total:
+                self._log(f"💬 Loaded {total} APRS message(s) across {len(self.conversations)} conversation(s)")
+        except Exception as e:
+            self._log(f"⚠️ Failed to load conversations: {e}")
+            self.conversations = {}
+            self.msg_seq = 0
     
-    def _send_message(self):
-        """Send an APRS message"""
+    def _send_message_is_btn(self):
+        """Send button → APRS-IS."""
+        return self._send_message_core(transport="is")
+
+    def _send_message_rf_btn(self):
+        """Send button → RF."""
+        return self._send_message_core(transport="rf")
+
+    def _send_message_core(self, transport):
+        """Compose, store, and dispatch an APRS message via the chosen transport.
+
+        transport: "rf" or "is"
+        """
         to_call = self.msg_to_edit.text().strip().upper()
         message = self.msg_text_edit.text().strip()
-        
+
         if not to_call:
-            self.msg_status.setText("❌ Enter destination callsign")
-            self.msg_status.setStyleSheet("color: #ef5350;")
+            self._msg_set_status("❌ Enter destination callsign", "#ef5350")
             return
-        
         if not message:
-            self.msg_status.setText("❌ Enter a message")
-            self.msg_status.setStyleSheet("color: #ef5350;")
+            self._msg_set_status("❌ Enter a message", "#ef5350")
             return
-        
+        if len(message) > 67:
+            self._msg_set_status(f"❌ Message too long ({len(message)}/67)", "#ef5350")
+            return
+
         my_call = self.callsign_edit.text().strip().upper()
-        my_ssid = self.ssid_combo.currentData()
+        my_ssid = self.ssid_combo.currentData() or 0
         full_call = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
-        
+
         if not my_call or my_call == "N0CALL":
-            self.msg_status.setText("❌ Set your callsign in Transmit tab")
-            self.msg_status.setStyleSheet("color: #ef5350;")
+            self._msg_set_status("❌ Set your callsign first", "#ef5350")
             return
-        
-        # Generate message sequence number
-        self.msg_seq = (self.msg_seq + 1) % 100000
-        seq_str = f"{self.msg_seq}"
-        
-        # Format: :DEST_CALL:message{seq
-        # Destination must be 9 chars, padded with spaces
-        dest_padded = f"{to_call:9s}"
-        info = f":{dest_padded}:{message}{{{seq_str}"
-        
-        # Store the message
+
+        # Build message info field, optionally with seq for ack tracking
+        want_ack = self.msg_request_ack.isChecked()
+        seq_str = None
+        if want_ack:
+            self.msg_seq = (self.msg_seq + 1) % 100000
+            seq_str = f"{self.msg_seq}"
+
+        # Addressee field is exactly 9 chars, space-padded
+        dest_padded = f"{to_call:<9s}"
+        if seq_str:
+            info = f":{dest_padded}:{message}{{{seq_str}"
+        else:
+            info = f":{dest_padded}:{message}"
+
+        # Store the message (conversation keyed by remote callsign)
+        import datetime
+        now = datetime.datetime.now()
+        time_str = now.strftime("%H:%M:%S")
+        ts_iso = now.isoformat(timespec="seconds")
+
         if to_call not in self.conversations:
             self.conversations[to_call] = []
-        
-        import datetime
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        
+
         self.conversations[to_call].append({
             "from": full_call,
             "to": to_call,
             "text": message,
-            "time": now,
-            "acked": False,
-            "seq": seq_str
+            "time": time_str,
+            "ts_iso": ts_iso,
+            "acked": not want_ack,  # if no ack requested, treat as "delivered"
+            "seq": seq_str,
+            "transport": transport,
         })
-        
+
         self.current_conv = to_call
-        self._update_conversation_list()
-        self._refresh_message_history()
-        
-        # Clear input
-        self.msg_text_edit.clear()
-        
-        # Send via RF if PTT is connected
-        if self.ptt_serial and self.ptt_serial.is_open:
-            self._send_message_rf(full_call, info)
+
+        # Dispatch
+        if transport == "rf":
+            ok = self._send_message_rf(full_call, info)
         else:
-            # Send via APRS-IS if connected
-            if hasattr(self, 'aprs_is_socket') and self.aprs_is_socket:
-                self._send_message_is(full_call, to_call, info)
-            else:
-                self.msg_status.setText("⚠️ Message queued (no TX/APRS-IS)")
-                self.msg_status.setStyleSheet("color: #ffb74d;")
-    
+            ok = self._send_message_is(full_call, to_call, info)
+
+        if ok:
+            self.msg_text_edit.clear()
+
+        self._refresh_message_history()
+        self._msg_refresh_recent_menu()
+        self._save_conversations()
+
+    def _msg_set_status(self, text, color="#80cbc4"):
+        """Update the small status label next to the send buttons."""
+        if hasattr(self, "msg_status") and self.msg_status:
+            self.msg_status.setText(text)
+            self.msg_status.setStyleSheet(f"color: {color}; font-size: 11px;")
+
     def _send_message_rf(self, from_call, info):
-        """Send message via RF"""
-        self.msg_status.setText("📡 Sending via RF...")
-        self.msg_status.setStyleSheet("color: #64b5f6;")
-        
-        # Build and send the packet (similar to beacon)
+        """Send an already-formatted APRS message info field via RF (AX.25 / AFSK).
+
+        Returns True on success, False on failure. Mirrors send_beacon's PTT-auto-connect
+        pattern and uses Settings-tab audio/level widgets (not the legacy hidden combos).
+        """
+        if not HAS_SOUNDDEVICE:
+            self._msg_set_status("❌ sounddevice not installed", "#ef5350")
+            return False
+
+        self._msg_set_status("📡 Sending via RF…", "#64b5f6")
+
+        # Parse path
         path_str = self.path_combo.currentText().strip()
         if path_str.upper() == "DIRECT":
             path = []
@@ -6086,69 +7881,115 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 p = p.strip()
                 if "-" in p:
                     call, ssid = p.split("-")
-                    path.append((call, int(ssid)))
+                    try:
+                        path.append((call, int(ssid)))
+                    except ValueError:
+                        path.append((call, 0))
                 else:
                     path.append((p, 0))
-        
+
         my_call = self.callsign_edit.text().strip().upper()
-        my_ssid = self.ssid_combo.currentData()
-        
-        # Log the actual packet that will be sent
+        my_ssid = self.ssid_combo.currentData() or 0
+
+        # Auto-connect PTT if not connected (same pattern as send_beacon)
+        if not self.ptt_serial or not self.ptt_serial.is_open:
+            if self.ptt_serial:
+                try:
+                    self.ptt_serial.close()
+                except Exception:
+                    pass
+                self.ptt_serial = None
+            ptt_port = self.settings_ptt_combo.currentData() if hasattr(self, "settings_ptt_combo") else None
+            if ptt_port:
+                try:
+                    self.ptt_serial = serial.Serial(ptt_port, 9600, timeout=0.1)
+                    self._set_ptt(False)
+                    self.preset_log.append(f"✅ Auto-connected PTT: {ptt_port}")
+                    self._update_tx_status()
+                except Exception as e:
+                    self.ptt_serial = None
+                    self._msg_set_status(f"❌ PTT open failed: {e}", "#ef5350")
+                    return False
+            else:
+                self._msg_set_status("❌ PTT not configured (Settings tab)", "#ef5350")
+                return False
+
+        # TX audio device + level from Settings
+        tx_device = self.settings_tx_audio_combo.currentData() if hasattr(self, "settings_tx_audio_combo") else None
+        if tx_device is None:
+            self._msg_set_status("❌ No TX audio device (Settings tab)", "#ef5350")
+            return False
+        tx_level_pct = self.settings_tx_level.value() if hasattr(self, "settings_tx_level") else 10
+        tx_level = tx_level_pct / 100.0
+
+        # Log the outgoing packet
         path_display = ",".join([f"{c}-{s}" if s else c for c, s in path]) if path else "DIRECT"
         self._log(f"📤 MSG TX: {from_call}>APPR01,{path_display}:{info}")
-        
-        packet = APRSPacketBuilder.build_ui_packet(
-            my_call, my_ssid, "APPR01", 0, path, info
-        )
-        fcs = APRSPacketBuilder.compute_fcs(packet)
-        frame = packet + bytes([fcs & 0xFF, (fcs >> 8) & 0xFF])
-        
-        mod = AFSKModulator(TX_SAMPLE_RATE)
-        audio = mod.generate_packet_audio(frame, preamble_flags=40, postamble_flags=8)
-        
-        tx_level = self.tx_level_slider.value() / 100.0
-        audio = audio * tx_level
-        audio = apply_cosine_ramp(audio, TX_SAMPLE_RATE, ramp_ms=10.0)
-        
-        # Get TX device
-        tx_idx = self.tx_audio_combo.currentData()
-        if tx_idx is None:
-            self.msg_status.setText("❌ No TX audio device")
-            self.msg_status.setStyleSheet("color: #ef5350;")
-            return
-        
-        # PTT on, play, PTT off
+        self.preset_log.append(f"<br><span style='color:#64b5f6'>💬 TX Message…</span>")
+        self.preset_log.append(f"   From: <span style='color:#ffd54f'>{from_call}</span>")
+        self.preset_log.append(f"   Info: <span style='color:#80deea'>{info}</span>")
+
         try:
+            packet = APRSPacketBuilder.build_ui_packet(
+                my_call, my_ssid, "APPR01", 0, path, info
+            )
+            fcs = APRSPacketBuilder.compute_fcs(packet)
+            frame = packet + bytes([fcs & 0xFF, (fcs >> 8) & 0xFF])
+
+            mod = AFSKModulator(TX_SAMPLE_RATE)
+            audio = mod.generate_packet_audio(frame, preamble_flags=80, postamble_flags=10)
+            silence = np.zeros(int(TX_SAMPLE_RATE * 0.03), dtype=np.float32)
+            audio = np.concatenate([silence, audio, silence])
+            audio = apply_cosine_ramp(audio, TX_SAMPLE_RATE, ramp_ms=5.0)
+            audio = audio * tx_level
+            if float(np.abs(audio).max()) > 0.9:
+                audio = np.tanh(audio * 1.5) * 0.9
+
+            self.tx_in_progress = True
             self._set_ptt(True)
             time.sleep(0.05)
-            sd.play(audio, TX_SAMPLE_RATE, device=tx_idx)
+            sd.play(audio, TX_SAMPLE_RATE, device=tx_device)
             sd.wait()
             time.sleep(0.05)
             self._set_ptt(False)
-            
-            self.msg_status.setText("✓ Sent via RF")
-            self.msg_status.setStyleSheet("color: #69f0ae;")
+            self.tx_in_progress = False
+            self.tx_end_time = time.time()
+
+            self._msg_set_status("✓ Sent via RF", "#69f0ae")
+            return True
         except Exception as e:
-            self._set_ptt(False)
-            self.msg_status.setText(f"❌ TX failed: {e}")
-            self.msg_status.setStyleSheet("color: #ef5350;")
-    
+            try:
+                self._set_ptt(False)
+            except Exception:
+                pass
+            self.tx_in_progress = False
+            self._msg_set_status(f"❌ TX failed: {e}", "#ef5350")
+            return False
+
     def _send_message_is(self, from_call, to_call, info):
-        """Send message via APRS-IS"""
+        """Send an already-formatted APRS message info field via APRS-IS.
+
+        Returns True on success, False on failure.
+        """
+        if not (hasattr(self, "aprs_is_socket") and self.aprs_is_socket and self.aprs_is_running):
+            self._msg_set_status("❌ APRS-IS not connected", "#ef5350")
+            return False
         try:
             packet = f"{from_call}>APPR01,TCPIP*:{info}\r\n"
             self.aprs_is_socket.send(packet.encode())
-            self.msg_status.setText("✓ Sent via APRS-IS")
-            self.msg_status.setStyleSheet("color: #69f0ae;")
+            self._msg_set_status("✓ Sent via APRS-IS", "#69f0ae")
             self._log(f"📤 MSG IS: {packet.strip()}")
+            return True
         except Exception as e:
-            self.msg_status.setText(f"❌ Send failed: {e}")
-            self.msg_status.setStyleSheet("color: #ef5350;")
+            self._msg_set_status(f"❌ Send failed: {e}", "#ef5350")
+            return False
     
     def _handle_incoming_message(self, from_call, to_call, message, seq=None):
         """Handle an incoming APRS message"""
         import datetime
-        now = datetime.datetime.now().strftime("%H:%M:%S")
+        now = datetime.datetime.now()
+        time_str = now.strftime("%H:%M:%S")
+        ts_iso = now.isoformat(timespec="seconds")
         
         # Store the message
         if from_call not in self.conversations:
@@ -6158,17 +7999,16 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "from": from_call,
             "to": to_call,
             "text": message,
-            "time": now,
+            "time": time_str,
+            "ts_iso": ts_iso,
             "acked": True,  # Incoming messages don't need ack tracking
-            "seq": seq
+            "seq": seq,
+            "transport": "rx",
         })
         
-        self._update_conversation_list()
-        self._save_conversations()  # Auto-save
-        
-        # If this conversation is currently selected, refresh it
-        if self.current_conv == from_call:
-            self._refresh_message_history()
+        self._refresh_message_history()
+        self._msg_refresh_recent_menu()
+        self._save_conversations()
         
         # Send ack if sequence number provided
         if seq:
@@ -6176,25 +8016,42 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         # Log it
         self._log(f"📨 MSG from {from_call}: {message}")
-        
-        # Flash the tab or show notification
-        self.tabs.setTabText(2, "💬 Messages *")
+
+        # Visual alert: flash the APRS tab title with a 💬 marker if user isn't already
+        # looking at the APRS tab (index 1). Cleared next time they switch to it.
+        try:
+            current = self.tabs.currentIndex()
+            if current != 1:
+                self.tabs.setTabText(1, "📻 APRS 💬*")
+        except Exception:
+            pass
     
     def _handle_ack(self, from_call, seq):
         """Handle an incoming message acknowledgment"""
-        my_call = f"{self.callsign_edit.text().strip().upper()}-{self.ssid_combo.currentData()}"
-        
+        my_call = self.callsign_edit.text().strip().upper()
+        my_ssid = self.ssid_combo.currentData() or 0
+        my_full = f"{my_call}-{my_ssid}" if my_ssid > 0 else my_call
+
         # Find and mark the message as acked
         for callsign, messages in self.conversations.items():
             for msg in messages:
-                if msg.get("seq") == seq and msg.get("from") == my_call and not msg.get("acked"):
+                if msg.get("seq") == seq and msg.get("from") == my_full and not msg.get("acked"):
                     msg["acked"] = True
                     self._log(f"✓ ACK received from {from_call} for msg #{seq}")
-                    self._update_conversation_list()
-                    self._save_conversations()  # Auto-save
-                    if self.current_conv == callsign:
-                        self._refresh_message_history()
+                    self._refresh_message_history()
+                    self._save_conversations()
                     return
+
+    def _on_tab_changed(self, index):
+        """Clear unread markers when user switches to APRS or VARA tab."""
+        try:
+            if index == 1:
+                self.tabs.setTabText(1, "📻 APRS")
+            vara_idx = self._find_vara_tab_index() if hasattr(self, "_find_vara_tab_index") else None
+            if vara_idx is not None and index == vara_idx:
+                self.tabs.setTabText(vara_idx, "📡 VARA FM")
+        except Exception:
+            pass
     
     def _send_ack(self, to_call, seq):
         """Send an acknowledgment for a received message"""
@@ -6444,10 +8301,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
         try:
             self.tx_audio_combo.clear()
             self.tx_audio_combo.setEnabled(True)
-            for i, d in enumerate(devices):
-                # Only show devices with output channels
-                if d.get("max_output_channels", 0) > 0:
-                    self.tx_audio_combo.addItem(f"{i}: {d['name']}", i)
+            for i, d, api_short, sr, ch in self._enum_audio("output"):
+                raw = f"{i}: {d['name']} [{api_short}]"
+                alias = self._alias_get("audio_output", self._audio_key(d['name'], api_short))
+                self.tx_audio_combo.addItem(self._decorate_alias(alias, raw), i)
             
             # Try to select USB audio codec (FT-991A) by default
             for i in range(self.tx_audio_combo.count()):
@@ -6668,6 +8525,11 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 if callsign and callsign != "N0CALL":
                     full_call = f"{callsign}-{ssid}" if ssid else callsign
                     self.vara_cmd_socket.send(f"MYCALL {full_call}\r".encode())
+                    # CRITICAL: remember the exact MYCALL string VARA was registered with.
+                    # Any subsequent CONNECT must use this same string as its source, otherwise
+                    # the link reply addressed back to <full_call> won't match VARA's listener
+                    # and the link will silently fail (endless retransmit loop).
+                    self.vara_registered_callsign = full_call
                     self._vara_log(f"📡 Set MYCALL: {full_call}")
                     time.sleep(0.2)
             except Exception as e:
@@ -6740,6 +8602,15 @@ class MainWindow(MonitorsMixin, QMainWindow):
         self.vara_kiss_connected = False
         
         self.vara_connected = False
+        # Reset chat link state when daemon goes away
+        self._vara_is_connected_to_remote = False
+        self.vara_registered_callsign = None
+        if hasattr(self, "_vara_chat_set_linked_ui"):
+            try:
+                self._vara_chat_set_linked_ui(False)
+            except Exception:
+                pass
+        self.vara_remote_call = None
         self._vara_log("✅ Disconnected from VARA FM")
         self._sync_vara_fm_connection_status()
 
@@ -7985,10 +9856,11 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     playback_rate = device_samplerate
                     self.preset_log.append(f"   Resampled: {TX_SAMPLE_RATE} → {device_samplerate} Hz")
                 
-                # Reshape audio for stereo if device requires 2 channels
+                # Reshape audio for stereo — left channel only for DigiRig
+                # DigiRig uses left channel for TX audio, right channel for VOX (keep silent)
                 if max_out_channels >= 2:
-                    # Duplicate mono to stereo
-                    audio_out = np.column_stack([audio, audio]).astype(np.float32)
+                    silence = np.zeros_like(audio)
+                    audio_out = np.column_stack([audio, silence]).astype(np.float32)
                 else:
                     audio_out = audio.astype(np.float32)
                     
@@ -8152,14 +10024,28 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "settings_ptt_port": self.settings_ptt_combo.currentData() if hasattr(self, 'settings_ptt_combo') else None,
             "settings_gps_port": self.settings_gps_combo.currentData() if hasattr(self, 'settings_gps_combo') else None,
             "settings_gps_baud": self.gps_baud_combo.currentData() if hasattr(self, 'gps_baud_combo') else 4800,
-            
-            # Settings tab - PTT line settings
+
+            # Settings tab - PTT method and line settings
+            "ptt_method": self.ptt_method_combo.currentText() if hasattr(self, 'ptt_method_combo') else "RTS/DTR",
             "ptt_rts_mode": self.ptt_rts_combo.currentText() if hasattr(self, 'ptt_rts_combo') else "Off",
             "ptt_dtr_mode": self.ptt_dtr_combo.currentText() if hasattr(self, 'ptt_dtr_combo') else "High=TX",
+
+            # CI-V CAT settings
+            "civ_port": self.civ_port_combo.currentData() if hasattr(self, 'civ_port_combo') else None,
+            "civ_baud": self.civ_baud_combo.currentText() if hasattr(self, 'civ_baud_combo') else "19200",
+            "civ_data": self.civ_data_combo.currentText() if hasattr(self, 'civ_data_combo') else "8",
+            "civ_parity": self.civ_parity_combo.currentText() if hasattr(self, 'civ_parity_combo') else "None",
+            "civ_stop": self.civ_stop_combo.currentText() if hasattr(self, 'civ_stop_combo') else "1",
+            "civ_addr": self.civ_addr_edit.text() if hasattr(self, 'civ_addr_edit') else "88",
+            "yaesu_port": self.yaesu_port_combo.currentData() if hasattr(self, 'yaesu_port_combo') else None,
+            "yaesu_baud": self.yaesu_baud_combo.currentText() if hasattr(self, 'yaesu_baud_combo') else "38400",
             
             # Settings tab - Audio
             "settings_rx_audio": self.settings_rx_audio_combo.currentData() if hasattr(self, 'settings_rx_audio_combo') else None,
             "settings_tx_audio": self.settings_tx_audio_combo.currentData() if hasattr(self, 'settings_tx_audio_combo') else None,
+            # Name-based keys — survive Windows renumbering. Loaded first, index used only as fallback.
+            "settings_rx_audio_key": self._audio_combo_key(getattr(self, 'settings_rx_audio_combo', None)),
+            "settings_tx_audio_key": self._audio_combo_key(getattr(self, 'settings_tx_audio_combo', None)),
             "settings_rx_gain": self.settings_rx_gain.value() if hasattr(self, 'settings_rx_gain') else 10,
             
             # Settings tab - APRS-IS
@@ -8233,8 +10119,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
             # Legacy fields (for compatibility)
             "ptt_port": self.ptt_port_combo.currentData(),
             "audio_device": self.dev_combo.currentData(),
+            "audio_device_key": self._audio_combo_key(getattr(self, 'dev_combo', None)),
             "gain": self.gain.value(),
             "tx_device": self.tx_audio_combo.currentData() if hasattr(self, 'tx_audio_combo') else None,
+            "tx_device_key": self._audio_combo_key(getattr(self, 'tx_audio_combo', None)),
             "tx_level": self.settings_tx_level.value() if hasattr(self, 'settings_tx_level') else 100,
             "aprs_is_server": self.aprs_is_server.text(),
             "aprs_is_port": self.aprs_is_port.value(),
@@ -8244,6 +10132,13 @@ class MainWindow(MonitorsMixin, QMainWindow):
             "auto_beacon_enabled": self.auto_beacon_enabled.isChecked() if hasattr(self, 'auto_beacon_enabled') else False,
             "auto_beacon_interval": self.auto_beacon_interval.value() if hasattr(self, 'auto_beacon_interval') else 10,
             "auto_beacon_mode": self.auto_beacon_mode.currentData() if hasattr(self, 'auto_beacon_mode') else "is",
+
+            # Audio API filter (see _enum_audio)
+            "audio_preferred_api": getattr(self, "audio_preferred_api", "MME"),
+            "audio_show_all_apis": bool(getattr(self, "audio_show_all_apis", False)),
+
+            # Device aliases (right-click Rename on any device combo)
+            "device_aliases": getattr(self, "device_aliases", {}),
         }
         try:
             with open(SETTINGS_FILE, "w") as f:
@@ -8336,14 +10231,20 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     if self.ptt_port_combo.itemData(i) == settings["ptt_port"]:
                         self.ptt_port_combo.setCurrentIndex(i)
                         break
-            if "audio_device" in settings and settings["audio_device"] is not None:
+            # Legacy audio_device (dev_combo) — prefer name-based, fall back to index
+            audio_key = settings.get("audio_device_key")
+            matched = self._audio_combo_select_by_key(self.dev_combo, audio_key)
+            if not matched and "audio_device" in settings and settings["audio_device"] is not None:
                 for i in range(self.dev_combo.count()):
                     if self.dev_combo.itemData(i) == settings["audio_device"]:
                         self.dev_combo.setCurrentIndex(i)
                         break
             if "gain" in settings:
                 self.gain.setValue(settings["gain"])
-            if "tx_device" in settings and settings["tx_device"] is not None:
+            # Legacy tx_device (tx_audio_combo) — same pattern
+            tx_key = settings.get("tx_device_key")
+            matched = self._audio_combo_select_by_key(self.tx_audio_combo, tx_key)
+            if not matched and "tx_device" in settings and settings["tx_device"] is not None:
                 for i in range(self.tx_audio_combo.count()):
                     if self.tx_audio_combo.itemData(i) == settings["tx_device"]:
                         self.tx_audio_combo.setCurrentIndex(i)
@@ -8357,7 +10258,32 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 self.tx_level_slider.setValue(tx_level_val)
             if hasattr(self, 'tx_level_label'):
                 self.tx_level_label.setText(f"{tx_level_val}%")
-            
+
+            # Audio API filter (short list = MME by default; matches VARA FM)
+            api_pref = settings.get("audio_preferred_api", "MME")
+            show_all = bool(settings.get("audio_show_all_apis", False))
+            self.audio_preferred_api = api_pref
+            self.audio_show_all_apis = show_all
+
+            # Device aliases — load BEFORE any repopulate so the alias-decorated labels appear
+            saved_aliases = settings.get("device_aliases", {}) or {}
+            for bucket in ("audio_input", "audio_output", "serial"):
+                self.device_aliases[bucket] = dict(saved_aliases.get(bucket, {}))
+
+            if hasattr(self, "settings_audio_api_combo"):
+                for i in range(self.settings_audio_api_combo.count()):
+                    if self.settings_audio_api_combo.itemData(i) == api_pref:
+                        self.settings_audio_api_combo.blockSignals(True)
+                        self.settings_audio_api_combo.setCurrentIndex(i)
+                        self.settings_audio_api_combo.blockSignals(False)
+                        break
+            if hasattr(self, "settings_audio_show_all_chk"):
+                self.settings_audio_show_all_chk.blockSignals(True)
+                self.settings_audio_show_all_chk.setChecked(show_all)
+                self.settings_audio_show_all_chk.blockSignals(False)
+            # Repopulate now that preference is known
+            self._set_audio_api_filter()
+
             # APRS-IS settings
             if "aprs_is_server" in settings:
                 self.aprs_is_server.setText(settings["aprs_is_server"])
@@ -8377,8 +10303,12 @@ class MainWindow(MonitorsMixin, QMainWindow):
                     if self.settings_gps_combo.itemData(i) == settings["settings_gps_port"]:
                         self.settings_gps_combo.setCurrentIndex(i)
                         break
-            
-            # Settings tab - PTT line settings
+
+            # Settings tab - PTT method and line settings
+            if hasattr(self, 'ptt_method_combo') and "ptt_method" in settings:
+                idx = self.ptt_method_combo.findText(settings["ptt_method"])
+                if idx >= 0:
+                    self.ptt_method_combo.setCurrentIndex(idx)
             if hasattr(self, 'ptt_rts_combo') and "ptt_rts_mode" in settings:
                 idx = self.ptt_rts_combo.findText(settings["ptt_rts_mode"])
                 if idx >= 0:
@@ -8387,6 +10317,20 @@ class MainWindow(MonitorsMixin, QMainWindow):
                 idx = self.ptt_dtr_combo.findText(settings["ptt_dtr_mode"])
                 if idx >= 0:
                     self.ptt_dtr_combo.setCurrentIndex(idx)
+
+            # CI-V CAT settings
+            if hasattr(self, 'civ_baud_combo') and "civ_baud" in settings:
+                self.civ_baud_combo.setCurrentText(settings["civ_baud"])
+            if hasattr(self, 'civ_data_combo') and "civ_data" in settings:
+                self.civ_data_combo.setCurrentText(settings["civ_data"])
+            if hasattr(self, 'civ_parity_combo') and "civ_parity" in settings:
+                self.civ_parity_combo.setCurrentText(settings["civ_parity"])
+            if hasattr(self, 'civ_stop_combo') and "civ_stop" in settings:
+                self.civ_stop_combo.setCurrentText(settings["civ_stop"])
+            if hasattr(self, 'civ_addr_edit') and "civ_addr" in settings:
+                self.civ_addr_edit.setText(settings["civ_addr"])
+            if hasattr(self, 'yaesu_baud_combo') and "yaesu_baud" in settings:
+                self.yaesu_baud_combo.setCurrentText(settings["yaesu_baud"])
             
             # Settings tab - Earthquake Monitor
             if hasattr(self, 'quake_radius') and "quake_radius" in settings:
@@ -8461,17 +10405,23 @@ class MainWindow(MonitorsMixin, QMainWindow):
             if hasattr(self, 'cache_map_zoom_slider') and "cache_map_zoom" in settings:
                 self.cache_map_zoom_slider.setValue(settings["cache_map_zoom"])
             
-            # Settings tab - Audio
-            if hasattr(self, 'settings_rx_audio_combo') and "settings_rx_audio" in settings and settings["settings_rx_audio"] is not None:
-                for i in range(self.settings_rx_audio_combo.count()):
-                    if self.settings_rx_audio_combo.itemData(i) == settings["settings_rx_audio"]:
-                        self.settings_rx_audio_combo.setCurrentIndex(i)
-                        break
-            if hasattr(self, 'settings_tx_audio_combo') and "settings_tx_audio" in settings and settings["settings_tx_audio"] is not None:
-                for i in range(self.settings_tx_audio_combo.count()):
-                    if self.settings_tx_audio_combo.itemData(i) == settings["settings_tx_audio"]:
-                        self.settings_tx_audio_combo.setCurrentIndex(i)
-                        break
+            # Settings tab - Audio (prefer name-based resolution; fall back to raw index)
+            if hasattr(self, 'settings_rx_audio_combo'):
+                rx_key = settings.get("settings_rx_audio_key")
+                matched = self._audio_combo_select_by_key(self.settings_rx_audio_combo, rx_key)
+                if not matched and "settings_rx_audio" in settings and settings["settings_rx_audio"] is not None:
+                    for i in range(self.settings_rx_audio_combo.count()):
+                        if self.settings_rx_audio_combo.itemData(i) == settings["settings_rx_audio"]:
+                            self.settings_rx_audio_combo.setCurrentIndex(i)
+                            break
+            if hasattr(self, 'settings_tx_audio_combo'):
+                tx_key = settings.get("settings_tx_audio_key")
+                matched = self._audio_combo_select_by_key(self.settings_tx_audio_combo, tx_key)
+                if not matched and "settings_tx_audio" in settings and settings["settings_tx_audio"] is not None:
+                    for i in range(self.settings_tx_audio_combo.count()):
+                        if self.settings_tx_audio_combo.itemData(i) == settings["settings_tx_audio"]:
+                            self.settings_tx_audio_combo.setCurrentIndex(i)
+                            break
             if hasattr(self, 'settings_rx_gain') and "settings_rx_gain" in settings:
                 self.settings_rx_gain.setValue(settings["settings_rx_gain"])
                 self._on_settings_rx_gain(settings["settings_rx_gain"])
@@ -8639,7 +10589,13 @@ class MainWindow(MonitorsMixin, QMainWindow):
             self.save_settings()
         except Exception as e:
             print(f"Error saving on close: {e}")
-        
+
+        # Stop the Settings-tab audio level monitor
+        try:
+            self._stop_settings_audio_monitor()
+        except Exception:
+            pass
+
         # Clean up APRS-IS connection
         try:
             self.aprs_is_running = False
@@ -8838,10 +10794,10 @@ class MainWindow(MonitorsMixin, QMainWindow):
             return
         
         try:
-            devices = list(sd.query_devices())
-            for i, d in enumerate(devices):
-                if d.get("max_input_channels", 0) > 0:
-                    self.dev_combo.addItem(f"{i}: {d['name']}", i)
+            for i, d, api_short, sr, ch in self._enum_audio("input"):
+                raw = f"{i}: {d['name']} [{api_short}]"
+                alias = self._alias_get("audio_input", self._audio_key(d['name'], api_short))
+                self.dev_combo.addItem(self._decorate_alias(alias, raw), i)
         except Exception as e:
             try:
                 self.dev_combo.addItem(f"Audio RX disabled ({type(e).__name__})")
@@ -8862,7 +10818,19 @@ class MainWindow(MonitorsMixin, QMainWindow):
         
         self.receiver = AudioReceiver(dev, self.gain.value() / 10.0)
         self.receiver.packet_received.connect(self.on_packet)
-        self.receiver.audio_level.connect(lambda v: self.meter.setValue(min(max(int(v*500),0),100)))
+        # Update both meters (Receive tab + Settings tab) from the same signal
+        def _update_rx_meters(v):
+            val = min(max(int(v * 500), 0), 100)
+            try:
+                self.meter.setValue(val)
+            except Exception:
+                pass
+            if hasattr(self, "settings_rx_meter") and self.settings_rx_meter is not None:
+                try:
+                    self.settings_rx_meter.setValue(val)
+                except Exception:
+                    pass
+        self.receiver.audio_level.connect(_update_rx_meters)
         self.receiver.status_update.connect(self._log)
         self.receiver.error_occurred.connect(self._log)
         self.receiver.start()
@@ -8889,6 +10857,8 @@ class MainWindow(MonitorsMixin, QMainWindow):
         if hasattr(self, '_sync_beacon_connection_status'):
             self._sync_beacon_connection_status()
         self.meter.setValue(0)
+        if hasattr(self, "settings_rx_meter"):
+            self.settings_rx_meter.setValue(0)
 
     def on_packet(self, pkt, sl):
         # Ignore packets during TX and for 2 seconds after (prevent self-decode)
