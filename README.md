@@ -5,7 +5,7 @@ A **free**, modern APRS transceiver for Windows with real-time mapping, emergenc
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
-![Version](https://img.shields.io/badge/Version-0.1.7--beta-orange.svg)
+![Version](https://img.shields.io/badge/Version-0.1.8--beta-orange.svg)
 
 📖 **[Wiki & Documentation](https://github.com/smashingwaffle/pytnc-pro/wiki)**
 
