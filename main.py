@@ -1666,6 +1666,22 @@ class MainWindow(MonitorsMixin, PTTMixin, QMainWindow):
         self.msg_request_ack.setStyleSheet("color: #b0bec5; font-size: 11px;")
         row3.addWidget(self.msg_request_ack)
 
+        # Clear log — labeled button, sits right next to the Ack checkbox
+        msg_clear_btn = QPushButton("🗑 Clear log")
+        msg_clear_btn.setToolTip("Clear message log view (offers option to also delete stored conversations)")
+        msg_clear_btn.setFixedHeight(24)
+        msg_clear_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a2a3a; color: #b0bec5;
+                border: 1px solid #1e3a5f; border-radius: 3px;
+                padding: 0 8px; font-size: 11px;
+            }
+            QPushButton:hover { background: #1e3a5f; color: #ef5350; }
+            QPushButton:pressed { background: #0d1929; }
+        """)
+        msg_clear_btn.clicked.connect(self._msg_clear_log_view)
+        row3.addWidget(msg_clear_btn)
+
         self.msg_status = QLabel("")
         self.msg_status.setStyleSheet("color: #607d8b; font-size: 11px;")
         row3.addWidget(self.msg_status, 1)
@@ -1730,6 +1746,37 @@ class MainWindow(MonitorsMixin, PTTMixin, QMainWindow):
         self.conv_list.hide()
 
         return grp
+
+    def _msg_clear_log_view(self):
+        """Clear the message log view. Asks whether to also delete stored conversations."""
+        from PyQt6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear message log")
+        box.setText("Clear the message log?")
+        box.setInformativeText(
+            "• <b>Clear view</b> hides messages here but keeps history in pytnc_conversations.json.\n"
+            "• <b>Delete history</b> also wipes all stored conversations permanently."
+        )
+        clear_view = box.addButton("Clear view", QMessageBox.ButtonRole.AcceptRole)
+        delete_all = box.addButton("Delete history", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(clear_view)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is cancel:
+            return
+        if clicked is delete_all:
+            self.conversations = {}
+            try:
+                self._save_conversations()
+            except Exception:
+                pass
+            self._msg_refresh_recent_menu()
+            self._log("💬 APRS message history deleted")
+        # In both cases, wipe the visible log
+        if hasattr(self, "msg_history") and self.msg_history is not None:
+            self.msg_history.clear()
 
     def _msg_update_counter(self, text):
         """Update the 0/67 character counter and color it as it approaches the limit."""
@@ -10379,6 +10426,12 @@ class MainWindow(MonitorsMixin, PTTMixin, QMainWindow):
                     self.rx_aqi_check.blockSignals(True)
                     self.rx_aqi_check.setChecked(settings["aqi_enabled"])
                     self.rx_aqi_check.blockSignals(False)
+                # If AQI was enabled last session, actually fire the toggle handler now
+                # so the timer starts and the map marker gets drawn. Delayed slightly so
+                # the Leaflet map inside QWebEngineView has finished initializing —
+                # otherwise the marker JS runs before `map` exists and silently fails.
+                if settings["aqi_enabled"]:
+                    QTimer.singleShot(3000, lambda: self._toggle_aqi_monitor(True))
             
             # Settings tab - Hospitals
             if hasattr(self, 'hospital_radius') and "hospital_radius" in settings:
@@ -11165,7 +11218,7 @@ class MainWindow(MonitorsMixin, PTTMixin, QMainWindow):
                     tooltip_parts.append("📡 Digipeater")
                     # Show recent traffic through this digi
                     if src_for_parse in self.digi_traffic and self.digi_traffic[src_for_parse]:
-                        recent = self.digi_traffic[src][-5:]  # Last 5
+                        recent = self.digi_traffic[src_for_parse][-5:]  # Last 5
                         traffic_list = ", ".join([f"{s[0]}" for s in reversed(recent)])
                         tooltip_parts.append(f"📶 Recent: {traffic_list}")
                 
